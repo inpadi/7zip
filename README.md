@@ -1,2 +1,86 @@
-# 7-Zip on GitHub
-7-Zip website: [7-zip.org](https://7-zip.org)
+# 7-Zip Go port
+
+This fork is migrating the portable archive engine and `7z` command from upstream [7-Zip](https://7-zip.org/) 26.02 to Go. Windows GUI, shell integration, and SDK/COM compatibility are explicitly out of scope.
+
+The migration is incremental. `C/`, `CPP/`, and `Asm/` remain as the pinned upstream reference until every retained CLI and format requirement passes the replacement gates in [MIGRATION.md](MIGRATION.md). They are not linked into the Go executable.
+
+## Download signed Windows binaries
+
+| Platform | Download |
+| --- | --- |
+| Windows x64 | [Download `i7z.exe`](Out/windows/amd64/i7z.exe?raw=1) |
+| Windows ARM64 | [Download `i7z.exe`](Out/windows/arm64/i7z.exe?raw=1) |
+| Windows x86 (32-bit) | [Download `i7z.exe`](Out/windows/386/i7z.exe?raw=1) |
+
+These binaries are Authenticode-signed by `inpadi ApS`. Verify the signature after downloading:
+
+```powershell
+Get-AuthenticodeSignature .\i7z.exe | Format-List Status, SignerCertificate
+```
+
+A valid official binary reports `Status: Valid`. See [RELEASE.md](RELEASE.md) for the complete release and verification policy.
+
+## Implemented
+
+Commands:
+
+- `a` creates an archive or adds/replaces files in an existing archive
+- `u` updates an archive using the same transactional rewrite engine
+- `l` and `l -slt` list archive contents
+- `t` decodes and verifies archive contents
+- `x` and `e` extract with or without stored paths
+
+Formats:
+
+- `.7z`: Copy, LZMA, and LZMA2 creation; solid or non-solid blocks; AES-256 data encryption; optional encrypted headers; password-protected reading; directory metadata; and transactional updates
+- `.zip`: Store/Deflate creation, reading, extraction, and transactional updates
+- `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`, `.tar.zst`/`.tzst`: creation, reading, extraction, and transactional updates
+- `.gz`, `.bz2`, `.xz`, `.zst`: single-stream creation, reading, extraction, and replacement
+- `.iso`, `.udf`: read, list, test, and extract UDF or ISO 9660/Joliet images, including Rock Ridge alternate names
+- `.wim`: read, list, test, and extract uncompressed, XPRESS, and LZX-compressed resources; multiple images are exposed under numbered directories
+- `.vhd` and `.vhdx`: read, list, test, and extract fixed or dynamic disks as a sparse logical `0.img`
+
+The image formats are currently read-only. Differencing VHD/VHDX parents, WIM LZMS resources, WIM reparse points, and mounting filesystems contained inside virtual disks are not implemented.
+
+Relevant switches include `-p{password}`, `-mhe=on|off`, `-ms=on|off`, `-mx[=0-9]`, `-m0={method}`, `-si{name}`, `-so`, `-r`, `-i!{mask}`, `-x!{mask}`, `@listfile`, `-scs{charset}`, `-ba`, `-slt`, and `-t{type}`. The wildcard engine follows 7-Zip's `*`/`?` component rules; brackets are literal, an exact directory selects its subtree, and `-r` recursively applies wildcard masks. `l -ba` uses upstream-compatible fixed-width entry rows. Unsupported switches and incompatible format combinations fail explicitly.
+
+Extraction rejects traversal and absolute paths, filesystem links/junctions in output paths, special files, Windows device paths, flattened-name collisions, and unsafe overwrites.
+
+## Build and test
+
+Go 1.25.5 or newer is required.
+
+```sh
+go build -o 7zip-go ./cmd/7zip
+go test ./...
+go vet ./...
+```
+
+When `7z`, `7zz`, or `7za` is installed, the tests run bidirectional interoperability checks for writable formats and upstream-consumer checks for read-only images. They cover solid and non-solid 7z blocks, encrypted data and headers, wrong passwords, updates, each advertised format, and payload verification.
+
+Examples:
+
+```sh
+7zip-go a -psecret -mhe=on archive.7z ./directory
+7zip-go u archive.7z ./changed-file
+7zip-go a backup.tar.zst ./directory
+7zip-go a -mx=9 -m0=lzma archive.7z ./directory
+cat payload.bin | 7zip-go a -sidata.bin -so -t7z archive.7z > streamed.7z
+7zip-go l -ba -r -i!*.txt archive.7z
+7zip-go t backup.tar.zst
+7zip-go x -ooutput archive.7z
+```
+
+## Remaining CLI scope
+
+The original project has more archive handlers and mutation commands than this milestone. RAR, CAB, RPM, DEB, and other upstream formats are not yet claimed. Delete, rename, multi-volume output, SFX, per-rule recursion modes, interactive prompts, and byte-identical output for commands other than `l -ba` remain.
+
+The 7z reader, format parser, codec registration, AES decoder, and branch filters are fully in-tree under `internal/sevenzip`. That code began from the BSD-licensed `github.com/bodgit/sevenzip` 1.6.4 implementation; its license and provenance are retained beside the source. The native 7z header/folder writer and AES encoder are implemented in-tree from the included upstream sources and [`DOC/7zFormat.txt`](DOC/7zFormat.txt).
+
+Upstream licensing material remains in [`DOC/License.txt`](DOC/License.txt), [`DOC/copying.txt`](DOC/copying.txt), and [`DOC/unRarLicense.txt`](DOC/unRarLicense.txt). Dependency versions are locked by `go.mod` and `go.sum`.
+
+## Project notices
+
+This is an independent, unofficial port. See [`COPYRIGHT.md`](COPYRIGHT.md) for the upstream acknowledgment and [`LICENSE`](LICENSE) for the license terms that apply to the original project, port changes, and incorporated components.
+
+Official release binaries must be cryptographically signed and published with verifiable checksums and provenance. The purpose and release requirements are documented in [`RELEASE.md`](RELEASE.md).

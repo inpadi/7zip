@@ -1,0 +1,61 @@
+# Licensing
+
+This repository contains material under several free and open-source licenses.
+Each file or component remains subject to its applicable license; this notice
+does not replace or narrow any existing copyright or license notice.
+
+## Original 7-Zip material
+
+7-Zip Copyright (C) 1999-2026 Igor Pavlov.
+
+The original 7-Zip sources in `C/`, `CPP/`, `Asm/`, and `DOC/`, together with
+any portions of this port derived or translated from those sources, remain
+under the licenses assigned by the upstream project. Most such code is free
+software under the GNU Lesser General Public License, version 2.1 or, at your
+option, any later version. Some files instead use BSD licenses, public-domain
+terms, or the GNU LGPL together with the unRAR restriction.
+
+The authoritative upstream license allocation and license texts are retained
+in:
+
+- `DOC/License.txt`
+- `DOC/copying.txt`
+- `DOC/unRarLicense.txt`
+
+## Independently authored port code
+
+Code and documentation first authored for this port, to the extent they are
+not derived from separately licensed material and do not carry another notice,
+are available under the MIT License:
+
+Copyright (c) 2026 7-Zip Go port contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Other third-party material
+
+Vendored components retain their original licenses and provenance notices:
+
+- `internal/sevenzip/LICENSE` and `internal/sevenzip/ORIGIN.md`
+- `internal/vdisk/LICENSE` and `internal/vdisk/ORIGIN.md`
+- `internal/wim/LICENSE` and `internal/wim/ORIGIN.md`
+- `internal/wim/xpress/LICENSE` and `internal/wim/xpress/ORIGIN.md`
+
+Go module dependencies are identified in `go.mod` and `go.sum` and remain
+subject to their respective upstream licenses.
