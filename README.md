@@ -6,7 +6,21 @@ The migration is incremental, but the legacy `C/`, `CPP/`, and `Asm/` reference 
 
 ## Download prebuilt binaries
 
-Prebuilt binaries are published only as tagged [GitHub Releases](../../releases). Each release includes a SHA-256 manifest, a per-target CycloneDX SBOM, and a GitHub build-provenance attestation. Binaries are not stored in the source tree.
+Prebuilt binaries from the current `main` branch are available directly from the repository:
+
+| Operating system | Architecture | Download |
+| --- | --- | --- |
+| Windows | x86-64 | [i7z.exe](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/windows/amd64/i7z.exe) |
+| Windows | ARM64 | [i7z.exe](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/windows/arm64/i7z.exe) |
+| Windows | x86 (32-bit) | [i7z.exe](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/windows/386/i7z.exe) |
+| Linux | x86-64 | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/linux/amd64/i7z) |
+| Linux | ARM64 | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/linux/arm64/i7z) |
+| Linux | ARM (32-bit) | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/linux/arm/i7z) |
+| Linux | x86 (32-bit) | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/linux/386/i7z) |
+| macOS | Intel | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/darwin/amd64/i7z) |
+| macOS | Apple silicon | [i7z](https://github.com/inpadi/7zip/raw/refs/heads/main/Out/darwin/arm64/i7z) |
+
+The matching checksums are in [`Out/SHA256SUMS`](Out/SHA256SUMS). These links follow `main`; tagged [GitHub Releases](../../releases) provide immutable release artifacts, per-target CycloneDX SBOMs, and GitHub build-provenance attestations.
 
 Verify a downloaded artifact before running it:
 
