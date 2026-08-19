@@ -106,7 +106,7 @@ func NewMetadataTable(fh io.ReadSeeker, offset, length int64) (*MetadataTable, e
 			}
 			lookup[itemID] = size
 		case PARENT_LOCATOR_GUID:
-			pl, err := NewParentLocator(fh)
+			pl, err := NewParentLocator(fh, int64(entry.Length))
 			if err != nil {
 				return nil, err
 			}

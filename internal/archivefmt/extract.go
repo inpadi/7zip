@@ -7,14 +7,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 )
 
-func extractEntry(root, name string, mode fs.FileMode, modified time.Time, reader io.Reader, options ExtractOptions, seen map[string]string) (int64, bool, error) {
-	target, relative, err := archive7z.SafeDestination(root, name, options.Flatten)
+func extractEntry(root *security.Root, name string, mode fs.FileMode, declared uint64, reader io.Reader, options ExtractOptions, seen map[string]string, budget *security.Budget) (int64, bool, error) {
+	_, relative, err := archive7z.SafeDestination(".", name, options.Flatten)
 	if err != nil {
+		return 0, false, err
+	}
+	if err := budget.AddEntry(name, declared); err != nil {
 		return 0, false, err
 	}
 	if mode.IsDir() && options.Flatten {
@@ -26,7 +29,11 @@ func extractEntry(root, name string, mode fs.FileMode, modified time.Time, reade
 	}
 	seen[key] = name
 	if mode.IsDir() {
-		if err := archive7z.SecureMkdirAll(root, relative, 0o755); err != nil {
+		directory, err := root.MkdirRoot(relative, 0o755)
+		if err != nil {
+			return 0, false, err
+		}
+		if err := directory.Close(); err != nil {
 			return 0, false, err
 		}
 		return 0, false, nil
@@ -34,101 +41,78 @@ func extractEntry(root, name string, mode fs.FileMode, modified time.Time, reade
 	if mode.Type() != 0 {
 		return 0, false, fmt.Errorf("refusing unsupported special entry %q (%s)", name, mode.Type())
 	}
-	if err := archive7z.SecureMkdirAll(root, filepath.Dir(relative), 0o755); err != nil {
-		return 0, false, err
-	}
-	skip, err := archive7z.PrepareTarget(target, options.Overwrite)
-	if err != nil || skip {
-		return 0, false, err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(target), ".7zip-extract-*.tmp")
+	parent, err := root.MkdirRoot(filepath.Dir(relative), 0o755)
 	if err != nil {
 		return 0, false, err
 	}
-	tempName := temp.Name()
+	defer parent.Close()
+	target := filepath.Base(relative)
+	existing, statErr := parent.Lstat(target)
+	if statErr == nil {
+		if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
+			return 0, false, fmt.Errorf("refusing to replace non-regular path %q", relative)
+		}
+		switch options.Overwrite {
+		case OverwriteSkip:
+			return 0, false, nil
+		case OverwriteAll:
+		default:
+			return 0, false, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+		}
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return 0, false, statErr
+	}
+	tempName, temp, err := parent.CreateTemp()
+	if err != nil {
+		return 0, false, err
+	}
 	removeTemp := true
 	defer func() {
 		_ = temp.Close()
 		if removeTemp {
-			_ = os.Remove(tempName)
+			_ = parent.Remove(tempName)
 		}
 	}()
-	n, err := io.Copy(temp, reader)
+	n, err := budget.Copy(temp, reader, name)
 	if err != nil {
+		return n, false, err
+	}
+	if err := temp.Chmod(security.SafeFileMode(mode)); err != nil {
+		return n, false, err
+	}
+	if err := temp.Sync(); err != nil {
 		return n, false, err
 	}
 	if err := temp.Close(); err != nil {
 		return n, false, err
 	}
-	perm := mode.Perm()
-	if perm == 0 {
-		perm = 0o600
-	}
-	if err := os.Chmod(tempName, perm); err != nil {
-		return n, false, err
-	}
-	if !modified.IsZero() {
-		if err := os.Chtimes(tempName, modified, modified); err != nil {
-			return n, false, err
-		}
-	}
 	if options.Overwrite == OverwriteAll {
-		if err := archive7z.RemoveExistingRegular(target); err != nil {
+		if statErr == nil {
+			if err := parent.Remove(target); err != nil {
+				return n, false, err
+			}
+		}
+		if err := parent.Rename(tempName, target); err != nil {
 			return n, false, err
 		}
-	}
-	if err := os.Rename(tempName, target); err != nil {
+	} else if err := parent.Link(tempName, target); err != nil {
+		if options.Overwrite == OverwriteSkip && errors.Is(err, fs.ErrExist) {
+			return 0, false, nil
+		}
+		if errors.Is(err, fs.ErrExist) {
+			return n, false, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+		}
+		return n, false, fmt.Errorf("publish %q without replacement: %w", relative, err)
+	} else if err := parent.Remove(tempName); err != nil {
 		return n, false, err
 	}
 	removeTemp = false
 	return n, true, nil
 }
 
-func extractionRoot(output string) (string, error) {
+func extractionRoot(output string) (*security.Root, error) {
 	if output == "" {
 		output = "."
 	}
-	if err := archive7z.SecureMkdirAll(output, "", 0o755); err != nil {
-		return "", err
-	}
-	return output, nil
-}
-
-func publish(tempName, archive string, existed bool) error {
-	if !existed {
-		return os.Rename(tempName, archive)
-	}
-	if err := os.Rename(tempName, archive); err == nil {
-		return nil
-	}
-	backupFile, err := os.CreateTemp(filepath.Dir(archive), ".archive-backup-*.tmp")
-	if err != nil {
-		return err
-	}
-	backup := backupFile.Name()
-	if err := backupFile.Close(); err != nil {
-		return err
-	}
-	if err := os.Remove(backup); err != nil {
-		return err
-	}
-	if err := os.Rename(archive, backup); err != nil {
-		return err
-	}
-	if err := os.Rename(tempName, archive); err != nil {
-		_ = os.Rename(backup, archive)
-		return err
-	}
-	return os.Remove(backup)
-}
-
-func archiveExists(name string) (bool, error) {
-	_, err := os.Stat(name)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
+	return security.OpenExtractionRoot(output)
 }

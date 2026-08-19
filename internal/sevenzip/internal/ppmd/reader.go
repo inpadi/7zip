@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/stangelandcl/ppmd"
 )
 
@@ -60,6 +61,12 @@ func NewReader(p []byte, uncompressedSize uint64, readers []io.ReadCloser) (io.R
 
 	order := p[0]
 	memory := binary.LittleEndian.Uint32(p[1:])
+	if memory == 0 || memory > security.MaxDecoderMemory {
+		return nil, fmt.Errorf("ppmd: memory request exceeds the %d-byte limit", security.MaxDecoderMemory)
+	}
+	if uncompressedSize > uint64(security.MaxFileBytes) {
+		return nil, fmt.Errorf("ppmd: output exceeds the %d-byte file limit", security.MaxFileBytes)
+	}
 
 	pr, err := ppmd.NewH7zReader(readers[0], int(order), int(memory), int(uncompressedSize)) //nolint:gosec
 	if err != nil {

@@ -6,16 +6,16 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math"
 
 	"github.com/google/uuid"
 )
 
 type RegionTable struct {
-	fh      io.ReadSeeker
-	offset  int64
-	header  RegionTableHeader
-	entries []RegionTableEntry
-	lookup  map[uuid.UUID]RegionTableEntry
+	fh     io.ReadSeeker
+	offset int64
+	header RegionTableHeader
+	lookup map[uuid.UUID]RegionTableEntry
 }
 
 type RegionTableHeader struct {
@@ -69,7 +69,9 @@ func NewRegionTable(fh io.ReadSeeker, offset int64) (*RegionTable, error) {
 
 	regionTable.lookup = make(map[uuid.UUID]RegionTableEntry)
 	for _, entry := range entries {
-		if entry.FileOffset%ALIGNMENT != 0 || entry.Length%ALIGNMENT != 0 || entry.FileOffset+uint64(entry.Length) < entry.FileOffset {
+		end := entry.FileOffset + uint64(entry.Length)
+		if entry.FileOffset%ALIGNMENT != 0 || entry.Length%ALIGNMENT != 0 ||
+			end < entry.FileOffset || end > math.MaxInt64 {
 			return nil, errors.New("invalid VHDX region extent")
 		}
 		regionTable.lookup[newUUIDFromBytesLE(entry.Guid[:])] = entry

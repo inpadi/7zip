@@ -20,6 +20,15 @@ func TestDestinationRejectsUnsafeNames(t *testing.T) {
 	}
 }
 
+func FuzzCleanArchiveName(f *testing.F) {
+	for _, seed := range []string{"file.txt", "dir/file", "../escape", "/absolute", "a\x00b"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, name string) {
+		_, _ = cleanArchiveName(name)
+	})
+}
+
 func TestDestinationStaysUnderRoot(t *testing.T) {
 	root := t.TempDir()
 	target, relative, err := destination(root, `folder\file.txt`, false)

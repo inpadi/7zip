@@ -56,7 +56,9 @@ type DynamicHeader struct {
 
 func readFooter(fh io.ReadSeeker) (*Footer, error) {
 	footer := &Footer{}
-	fh.Seek(-SECTOR_SIZE, io.SeekEnd)
+	if _, err := fh.Seek(-SECTOR_SIZE, io.SeekEnd); err != nil {
+		return nil, err
+	}
 	if err := binary.Read(fh, binary.BigEndian, footer); err != nil {
 		return nil, err
 	}

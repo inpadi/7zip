@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+
+	"github.com/inpadi/7zip/internal/security"
 )
 
 const VHD_MAGIC = "conectix"
@@ -20,6 +23,13 @@ type VHD struct {
 }
 
 func NewVHD(fh io.ReadSeeker) (*VHD, error) {
+	fileSize, err := fh.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	if fileSize < SECTOR_SIZE {
+		return nil, errors.New("VHD file is too small")
+	}
 	footer, err := readFooter(fh)
 	if err != nil {
 		return nil, err
@@ -31,9 +41,12 @@ func NewVHD(fh io.ReadSeeker) (*VHD, error) {
 		if footer.DataOffset != 0xFFFFFFFFFFFFFFFF {
 			return nil, errors.New("invalid fixed VHD data offset")
 		}
+		if footer.CurrentSize > uint64(fileSize-SECTOR_SIZE) {
+			return nil, errors.New("fixed VHD data exceeds file size")
+		}
 		diskItem = NewFixedDisk(fh, footer)
 	case 3:
-		diskItem, err = NewDynamicDisk(fh, footer)
+		diskItem, err = NewDynamicDisk(fh, footer, fileSize)
 		if err != nil {
 			return nil, err
 		}
@@ -52,6 +65,9 @@ func (v *VHD) ReadAt(p []byte, offset int64) (int, error) {
 	}
 	if offset >= v.size {
 		return 0, io.EOF
+	}
+	if len(p) > int(security.MaxDecoderMemory) {
+		return 0, errors.New("VHD read exceeds memory limit")
 	}
 	limited := false
 	if int64(len(p)) > v.size-offset {
@@ -103,8 +119,17 @@ func NewFixedDisk(fh io.ReadSeeker, footer *Footer) *FixedDisk {
 }
 
 func (d *FixedDisk) ReadSectors(sector int64, count int) ([]byte, error) {
+	if sector < 0 || count < 0 || count > int(security.MaxDecoderMemory)/SECTOR_SIZE {
+		return nil, errors.New("invalid fixed VHD sector range")
+	}
+	maxSectors := int64((d.footer.CurrentSize + SECTOR_SIZE - 1) / SECTOR_SIZE)
+	if sector > maxSectors || int64(count) > maxSectors-sector {
+		return nil, errors.New("fixed VHD sector range exceeds virtual disk")
+	}
 	buf := make([]byte, count*SECTOR_SIZE)
-	d.fh.Seek(int64(sector*SECTOR_SIZE), io.SeekStart)
+	if _, err := d.fh.Seek(sector*SECTOR_SIZE, io.SeekStart); err != nil {
+		return nil, err
+	}
 	_, err := io.ReadFull(d.fh, buf)
 	return buf, err
 }
@@ -116,11 +141,12 @@ type DynamicDisk struct {
 	bat              *BlockAllocationTable
 	sectorsPerBlock  int
 	sectorBitmapSize int
+	fileSize         int64
 }
 
-func NewDynamicDisk(fh io.ReadSeeker, footer *Footer) (*DynamicDisk, error) {
-	d := &DynamicDisk{fh: fh, footer: footer}
-	if footer.DataOffset > uint64(^uint64(0)>>1) {
+func NewDynamicDisk(fh io.ReadSeeker, footer *Footer, fileSize int64) (*DynamicDisk, error) {
+	d := &DynamicDisk{fh: fh, footer: footer, fileSize: fileSize}
+	if footer.DataOffset > math.MaxInt64 || footer.DataOffset+1024 < footer.DataOffset || footer.DataOffset+1024 > uint64(fileSize) {
 		return nil, errors.New("invalid dynamic VHD header offset")
 	}
 	if _, err := fh.Seek(int64(footer.DataOffset), io.SeekStart); err != nil {
@@ -146,8 +172,16 @@ func NewDynamicDisk(fh io.ReadSeeker, footer *Footer) (*DynamicDisk, error) {
 	if err := binary.Read(bytes.NewReader(data), binary.BigEndian, header); err != nil {
 		return nil, err
 	}
-	if header.BlockSize < SECTOR_SIZE || header.BlockSize&(header.BlockSize-1) != 0 || header.MaxTableEntries == 0 {
+	if header.BlockSize < SECTOR_SIZE || header.BlockSize > security.MaxDecoderMemory || header.BlockSize&(header.BlockSize-1) != 0 || header.MaxTableEntries == 0 {
 		return nil, errors.New("invalid dynamic VHD geometry")
+	}
+	batBytes := uint64(header.MaxTableEntries) * 4
+	if header.TableOffset > math.MaxInt64 || header.TableOffset+batBytes < header.TableOffset || header.TableOffset+batBytes > uint64(fileSize) {
+		return nil, errors.New("invalid dynamic VHD allocation table offset")
+	}
+	expectedEntries := (footer.CurrentSize + uint64(header.BlockSize) - 1) / uint64(header.BlockSize)
+	if uint64(header.MaxTableEntries) < expectedEntries {
+		return nil, errors.New("dynamic VHD allocation table is too small")
 	}
 	d.header = header
 	d.bat = NewBlockAllocationTable(fh, int64(header.TableOffset), int64(header.MaxTableEntries))
@@ -157,6 +191,13 @@ func NewDynamicDisk(fh io.ReadSeeker, footer *Footer) (*DynamicDisk, error) {
 }
 
 func (d *DynamicDisk) ReadSectors(sector int64, count int) ([]byte, error) {
+	if sector < 0 || count < 0 || count > int(security.MaxDecoderMemory)/SECTOR_SIZE {
+		return nil, errors.New("invalid dynamic VHD sector range")
+	}
+	maxSectors := int64((d.footer.CurrentSize + SECTOR_SIZE - 1) / SECTOR_SIZE)
+	if sector > maxSectors || int64(count) > maxSectors-sector {
+		return nil, errors.New("dynamic VHD sector range exceeds virtual disk")
+	}
 	var result bytes.Buffer
 	for count > 0 {
 		block, offset := sector/int64(d.sectorsPerBlock), sector%int64(d.sectorsPerBlock)
@@ -174,7 +215,12 @@ func (d *DynamicDisk) ReadSectors(sector int64, count int) ([]byte, error) {
 			continue
 		}
 		boff := int64(sectorOffset) + int64(d.sectorBitmapSize) + offset
-		_, err = d.fh.Seek(int64(boff*SECTOR_SIZE), io.SeekStart)
+		readSize := int64(readCount * SECTOR_SIZE)
+		fileOffset := boff * SECTOR_SIZE
+		if fileOffset < 0 || readSize > d.fileSize-fileOffset {
+			return nil, errors.New("dynamic VHD block exceeds file size")
+		}
+		_, err = d.fh.Seek(fileOffset, io.SeekStart)
 		if err != nil {
 			return nil, err
 		}

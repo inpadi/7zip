@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/sevenzip"
 )
 
@@ -140,7 +141,8 @@ func BenchmarkLZMA2Decompression(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, _, err := readFile(reader.File[0], io.Discard); err != nil {
+				var budget security.Budget
+				if _, _, err := readFile(reader.File[0], io.Discard, &budget); err != nil {
 					b.Fatal(err)
 				}
 			}

@@ -3,14 +3,19 @@
 package archivefmt
 
 import (
+	"bufio"
 	"io"
-	"runtime"
 
-	xzv2 "github.com/ulikunitz/xz/v2"
+	"github.com/inpadi/7zip/internal/security"
+	"github.com/ulikunitz/xz"
 )
 
+const xzInputBufferSize = 64 * 1024
+
 func newXZReader(input io.Reader) (io.ReadCloser, error) {
-	return xzv2.NewReaderOptions(input, xzv2.ReaderOptions{
-		Workers: min(runtime.GOMAXPROCS(0), 8),
-	})
+	reader, err := (xz.ReaderConfig{DictCap: security.MaxDecoderMemory}).NewReader(bufio.NewReaderSize(input, xzInputBufferSize))
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(reader), nil
 }

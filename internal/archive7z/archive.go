@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/sevenzip"
 )
 
@@ -68,9 +69,34 @@ type AddOptions struct {
 }
 
 type inputFile struct {
-	path string
-	name string
-	info fs.FileInfo
+	path     string
+	name     string
+	info     fs.FileInfo
+	root     *security.Root
+	relative string
+}
+
+func (i inputFile) open() (*os.File, error) {
+	before, err := i.root.Lstat(i.relative)
+	if err != nil {
+		return nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || !os.SameFile(i.info, before) {
+		return nil, fmt.Errorf("input %q changed after it was enumerated", i.path)
+	}
+	file, err := i.root.Open(i.relative)
+	if err != nil {
+		return nil, err
+	}
+	after, err := file.Stat()
+	if err != nil || !os.SameFile(before, after) {
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("input %q changed while it was opened", i.path)
+	}
+	return file, nil
 }
 
 // Add creates or updates a solid LZMA2-compressed 7z archive.
@@ -81,23 +107,24 @@ func Add(archive string, sources []string) (result Result, err error) {
 // AddWithOptions creates a new archive or transactionally rewrites an existing
 // archive while replacing entries supplied by sources.
 func AddWithOptions(archive string, sources []string, options AddOptions) (result Result, err error) {
-	_, statErr := os.Stat(archive)
-	exists := statErr == nil
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return result, statErr
-	}
-
 	archiveAbs, err := filepath.Abs(archive)
 	if err != nil {
 		return result, err
 	}
-	inputs, err := collectInputs(sources, archiveAbs, options.Recursive, options.Excludes)
+	inputs, roots, err := collectInputs(sources, archiveAbs, options.Recursive, options.Excludes)
 	if err != nil {
 		return result, err
 	}
+	defer closeInputRoots(roots)
 	if len(inputs) == 0 {
 		return result, errors.New("no files to process")
 	}
+	output, err := security.CreateOutput(archiveAbs)
+	if err != nil {
+		return result, err
+	}
+	defer output.Cleanup()
+	exists := output.Existed()
 
 	var old *sevenzip.ReadCloser
 	if exists {
@@ -112,21 +139,7 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 		}()
 	}
 
-	dir := filepath.Dir(archiveAbs)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return result, err
-	}
-	temp, err := os.CreateTemp(dir, ".7zip-go-*.tmp")
-	if err != nil {
-		return result, err
-	}
-	tempName := temp.Name()
-	defer func() {
-		_ = temp.Close()
-		if err != nil {
-			_ = os.Remove(tempName)
-		}
-	}()
+	temp := output.File()
 
 	level := -1
 	if options.LevelDefined {
@@ -147,6 +160,7 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 	for _, input := range inputs {
 		replacements[collisionKey(input.name)] = struct{}{}
 	}
+	var budget security.Budget
 	if old != nil {
 		for _, file := range old.File {
 			clean, cleanErr := cleanArchiveName(file.Name)
@@ -155,6 +169,12 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 			}
 			if _, replaced := replacements[collisionKey(clean)]; replaced {
 				continue
+			}
+			if err := checkFileCompressionRatio(file); err != nil {
+				return result, err
+			}
+			if err := budget.AddEntry(clean, file.UncompressedSize); err != nil {
+				return result, err
 			}
 			header := writerFileHeader{
 				Name:       clean,
@@ -175,7 +195,7 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 			if createErr != nil {
 				return result, fmt.Errorf("preserve %q: %w", clean, createErr)
 			}
-			_, checksum, copyErr := readFile(file, dst)
+			_, checksum, copyErr := readFile(file, dst, &budget)
 			closeErr := dst.Close()
 			if copyErr != nil {
 				return result, fmt.Errorf("preserve %q: %w", clean, copyErr)
@@ -190,6 +210,9 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 	}
 
 	for _, input := range inputs {
+		if err := budget.AddEntry(input.name, uint64(max(input.info.Size(), 0))); err != nil {
+			return result, err
+		}
 		header := writerFileHeader{
 			Name:       input.name,
 			Modified:   input.info.ModTime(),
@@ -206,12 +229,12 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 		if createErr != nil {
 			return result, fmt.Errorf("add %q: %w", input.name, createErr)
 		}
-		src, openErr := os.Open(input.path)
+		src, openErr := input.open()
 		if openErr != nil {
 			_ = dst.Close()
 			return result, fmt.Errorf("open %q: %w", input.path, openErr)
 		}
-		n, copyErr := io.Copy(dst, src)
+		n, copyErr := budget.Copy(dst, src, input.name)
 		closeSrcErr := src.Close()
 		closeDstErr := dst.Close()
 		if copyErr != nil {
@@ -232,7 +255,7 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 	if err = temp.Sync(); err != nil {
 		return result, fmt.Errorf("sync archive: %w", err)
 	}
-	if err = temp.Close(); err != nil {
+	if err = output.CloseFile(); err != nil {
 		return result, fmt.Errorf("close archive: %w", err)
 	}
 	if old != nil {
@@ -241,39 +264,10 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 		}
 		old = nil
 	}
-	if err = publishArchive(tempName, archiveAbs, exists); err != nil {
+	if err = output.Publish(); err != nil {
 		return result, fmt.Errorf("publish archive: %w", err)
 	}
 	return result, nil
-}
-
-func publishArchive(tempName, archive string, exists bool) error {
-	if !exists {
-		return os.Rename(tempName, archive)
-	}
-	if err := os.Rename(tempName, archive); err == nil {
-		return nil
-	}
-
-	backupFile, err := os.CreateTemp(filepath.Dir(archive), ".7zip-backup-*.tmp")
-	if err != nil {
-		return err
-	}
-	backup := backupFile.Name()
-	if err := backupFile.Close(); err != nil {
-		return err
-	}
-	if err := os.Remove(backup); err != nil {
-		return err
-	}
-	if err := os.Rename(archive, backup); err != nil {
-		return err
-	}
-	if err := os.Rename(tempName, archive); err != nil {
-		_ = os.Rename(backup, archive)
-		return err
-	}
-	return os.Remove(backup)
 }
 
 // List returns metadata for selected entries.
@@ -283,8 +277,14 @@ func List(archive, password string, patterns []string) ([]Entry, error) {
 		return nil, err
 	}
 	defer zr.Close()
+	compressedSize, err := zr.CompressedSize()
+	if err != nil {
+		return nil, err
+	}
 
 	entries := make([]Entry, 0, len(zr.File))
+	var budget security.Budget
+	budget.SetCompressedBytes(compressedSize)
 	for fileIndex, file := range zr.File {
 		selected, matchErr := matches(file.Name, patterns)
 		if matchErr != nil {
@@ -292,6 +292,12 @@ func List(archive, password string, patterns []string) ([]Entry, error) {
 		}
 		if !selected {
 			continue
+		}
+		if err := checkFileCompressionRatio(file); err != nil {
+			return nil, err
+		}
+		if err := budget.AddEntry(file.Name, file.UncompressedSize); err != nil {
+			return nil, err
 		}
 		packedSize, packedSizeDefined := file.PackedSize()
 		if fileIndex == 0 && !packedSizeDefined {
@@ -318,17 +324,32 @@ func Test(archive, password string, patterns []string) (Result, error) {
 		return Result{}, err
 	}
 	defer zr.Close()
+	compressedSize, err := zr.CompressedSize()
+	if err != nil {
+		return Result{}, err
+	}
 
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(compressedSize)
 	for _, file := range zr.File {
 		selected, matchErr := matches(file.Name, patterns)
 		if matchErr != nil {
 			return result, matchErr
 		}
-		if !selected || file.FileInfo().IsDir() {
+		if !selected {
 			continue
 		}
-		n, checksum, readErr := readFile(file, io.Discard)
+		if err := checkFileCompressionRatio(file); err != nil {
+			return result, err
+		}
+		if err := budget.AddEntry(file.Name, file.UncompressedSize); err != nil {
+			return result, err
+		}
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		n, checksum, readErr := readFile(file, io.Discard, &budget)
 		if readErr != nil {
 			return result, fmt.Errorf("test %q: %w", file.Name, readErr)
 		}
@@ -348,17 +369,32 @@ func WriteContents(archive, password string, patterns []string, dst io.Writer) (
 		return Result{}, err
 	}
 	defer zr.Close()
+	compressedSize, err := zr.CompressedSize()
+	if err != nil {
+		return Result{}, err
+	}
 
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(compressedSize)
 	for _, file := range zr.File {
 		selected, matchErr := matches(file.Name, patterns)
 		if matchErr != nil {
 			return result, matchErr
 		}
-		if !selected || file.FileInfo().IsDir() {
+		if !selected {
 			continue
 		}
-		n, checksum, readErr := readFile(file, dst)
+		if err := checkFileCompressionRatio(file); err != nil {
+			return result, err
+		}
+		if err := budget.AddEntry(file.Name, file.UncompressedSize); err != nil {
+			return result, err
+		}
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		n, checksum, readErr := readFile(file, dst, &budget)
 		if readErr != nil {
 			return result, fmt.Errorf("write %q: %w", file.Name, readErr)
 		}
@@ -373,22 +409,30 @@ func WriteContents(archive, password string, patterns []string, dst io.Writer) (
 
 // Extract safely writes selected regular files and directories.
 func Extract(archive string, opts ExtractOptions) (Result, error) {
-	root := opts.OutputDir
-	if root == "" {
-		root = "."
+	output := opts.OutputDir
+	if output == "" {
+		output = "."
 	}
-	if err := secureMkdirAll(root, "", 0o755); err != nil {
+	root, err := security.OpenExtractionRoot(output)
+	if err != nil {
 		return Result{}, err
 	}
+	defer root.Close()
 
 	zr, err := openReader(archive, opts.Password)
 	if err != nil {
 		return Result{}, err
 	}
 	defer zr.Close()
+	compressedSize, err := zr.CompressedSize()
+	if err != nil {
+		return Result{}, err
+	}
 
 	seen := make(map[string]string)
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(compressedSize)
 	for _, file := range zr.File {
 		selected, matchErr := matches(file.Name, opts.Patterns)
 		if matchErr != nil {
@@ -397,9 +441,15 @@ func Extract(archive string, opts ExtractOptions) (Result, error) {
 		if !selected {
 			continue
 		}
-		target, relative, pathErr := destination(root, file.Name, opts.Flatten)
+		if err := checkFileCompressionRatio(file); err != nil {
+			return result, err
+		}
+		_, relative, pathErr := destination(".", file.Name, opts.Flatten)
 		if pathErr != nil {
 			return result, pathErr
+		}
+		if err := budget.AddEntry(file.Name, file.UncompressedSize); err != nil {
+			return result, err
 		}
 		mode := file.Mode()
 		if mode.IsDir() && opts.Flatten {
@@ -412,67 +462,99 @@ func Extract(archive string, opts ExtractOptions) (Result, error) {
 		seen[key] = file.Name
 
 		if mode.IsDir() {
-			if err := secureMkdirAll(root, relative, 0o755); err != nil {
+			directory, err := root.MkdirRoot(relative, 0o755)
+			if err != nil {
 				return result, fmt.Errorf("create directory %q: %w", relative, err)
+			}
+			if err := directory.Close(); err != nil {
+				return result, fmt.Errorf("close directory %q: %w", relative, err)
 			}
 			continue
 		}
 		if mode.Type() != 0 {
 			return result, fmt.Errorf("refusing unsupported special entry %q (%s)", file.Name, mode.Type())
 		}
-		if err := secureMkdirAll(root, filepath.Dir(relative), 0o755); err != nil {
+		parent, err := root.MkdirRoot(filepath.Dir(relative), 0o755)
+		if err != nil {
 			return result, fmt.Errorf("create parent for %q: %w", relative, err)
 		}
-
-		skip, prepareErr := prepareTarget(target, opts.Overwrite)
-		if prepareErr != nil {
-			return result, prepareErr
+		target := filepath.Base(relative)
+		existing, statErr := parent.Lstat(target)
+		if statErr == nil {
+			if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
+				parent.Close()
+				return result, fmt.Errorf("refusing to replace non-regular path %q", relative)
+			}
+			switch opts.Overwrite {
+			case OverwriteSkip:
+				parent.Close()
+				continue
+			case OverwriteAll:
+			default:
+				parent.Close()
+				return result, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+			}
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			parent.Close()
+			return result, statErr
 		}
-		if skip {
-			continue
-		}
-		temp, tempErr := os.CreateTemp(filepath.Dir(target), ".7zip-extract-*.tmp")
+		tempName, temp, tempErr := parent.CreateTemp()
 		if tempErr != nil {
+			parent.Close()
 			return result, fmt.Errorf("create %q: %w", relative, tempErr)
 		}
-		tempName := temp.Name()
-		n, checksum, readErr := readFile(file, temp)
+		n, checksum, readErr := readFile(file, temp, &budget)
+		if readErr == nil {
+			readErr = temp.Chmod(security.SafeFileMode(mode))
+		}
+		if readErr == nil {
+			readErr = temp.Sync()
+		}
 		closeErr := temp.Close()
 		if readErr != nil {
-			_ = os.Remove(tempName)
+			_ = parent.Remove(tempName)
+			parent.Close()
 			return result, fmt.Errorf("extract %q: %w", file.Name, readErr)
 		}
 		if closeErr != nil {
-			_ = os.Remove(tempName)
+			_ = parent.Remove(tempName)
+			parent.Close()
 			return result, fmt.Errorf("close %q: %w", relative, closeErr)
 		}
 		if file.CRC32 != 0 && checksum != file.CRC32 {
-			_ = os.Remove(tempName)
+			_ = parent.Remove(tempName)
+			parent.Close()
 			return result, fmt.Errorf("extract %q: CRC mismatch: got %08X, want %08X", file.Name, checksum, file.CRC32)
 		}
-		perm := mode.Perm()
-		if perm == 0 {
-			perm = 0o600
-		}
-		if chmodErr := os.Chmod(tempName, perm); chmodErr != nil {
-			_ = os.Remove(tempName)
-			return result, fmt.Errorf("set mode for %q: %w", relative, chmodErr)
-		}
-		if !file.Modified.IsZero() {
-			if chtimesErr := os.Chtimes(tempName, file.Modified, file.Modified); chtimesErr != nil {
-				_ = os.Remove(tempName)
-				return result, fmt.Errorf("set time for %q: %w", relative, chtimesErr)
-			}
-		}
 		if opts.Overwrite == OverwriteAll {
-			if removeErr := removeExistingRegular(target); removeErr != nil {
-				_ = os.Remove(tempName)
-				return result, removeErr
+			if statErr == nil {
+				if removeErr := parent.Remove(target); removeErr != nil {
+					_ = parent.Remove(tempName)
+					parent.Close()
+					return result, removeErr
+				}
 			}
+			if renameErr := parent.Rename(tempName, target); renameErr != nil {
+				_ = parent.Remove(tempName)
+				parent.Close()
+				return result, fmt.Errorf("publish %q: %w", relative, renameErr)
+			}
+		} else if linkErr := parent.Link(tempName, target); linkErr != nil {
+			_ = parent.Remove(tempName)
+			parent.Close()
+			if opts.Overwrite == OverwriteSkip && errors.Is(linkErr, fs.ErrExist) {
+				continue
+			}
+			if errors.Is(linkErr, fs.ErrExist) {
+				return result, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+			}
+			return result, fmt.Errorf("publish %q without replacement: %w", relative, linkErr)
+		} else if removeErr := parent.Remove(tempName); removeErr != nil {
+			parent.Close()
+			return result, removeErr
 		}
-		if renameErr := os.Rename(tempName, target); renameErr != nil {
-			_ = os.Remove(tempName)
-			return result, fmt.Errorf("publish %q: %w", relative, renameErr)
+		if closeParentErr := parent.Close(); closeParentErr != nil {
+			return result, closeParentErr
 		}
 		result.Files++
 		result.Bytes += uint64(n)
@@ -496,13 +578,13 @@ func openReader(archive, password string) (*sevenzip.ReadCloser, error) {
 	return reader, nil
 }
 
-func readFile(file *sevenzip.File, dst io.Writer) (int64, uint32, error) {
+func readFile(file *sevenzip.File, dst io.Writer, budget *security.Budget) (int64, uint32, error) {
 	src, err := file.Open()
 	if err != nil {
 		return 0, 0, err
 	}
 	reader := &checksumReader{reader: src}
-	n, copyErr := io.Copy(dst, reader)
+	n, copyErr := budget.Copy(dst, reader, file.Name)
 	closeErr := src.Close()
 	if copyErr != nil {
 		return n, reader.checksum, copyErr
@@ -511,6 +593,14 @@ func readFile(file *sevenzip.File, dst io.Writer) (int64, uint32, error) {
 		return n, reader.checksum, closeErr
 	}
 	return n, reader.checksum, nil
+}
+
+func checkFileCompressionRatio(file *sevenzip.File) error {
+	packed, defined := file.PackedSize()
+	if !defined {
+		return nil
+	}
+	return security.CheckCompressionRatio(file.Name, file.UncompressedSize, packed)
 }
 
 type checksumReader struct {
@@ -559,61 +649,22 @@ func (r *checksumReader) WriteTo(dst io.Writer) (written int64, err error) {
 	}
 }
 
-func prepareTarget(target string, policy OverwritePolicy) (bool, error) {
-	info, err := os.Lstat(target)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return false, fmt.Errorf("refusing to replace non-regular path %q", target)
-	}
-	switch policy {
-	case OverwriteAll:
-		return false, nil
-	case OverwriteSkip:
-		return true, nil
-	default:
-		return false, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", target)
-	}
-}
-
-// PrepareTarget applies overwrite policy without following links.
-func PrepareTarget(target string, policy OverwritePolicy) (bool, error) {
-	return prepareTarget(target, policy)
-}
-
-func removeExistingRegular(target string) error {
-	info, err := os.Lstat(target)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("refusing to replace non-regular path %q", target)
-	}
-	return os.Remove(target)
-}
-
-// RemoveExistingRegular removes a regular output file and rejects other types.
-func RemoveExistingRegular(target string) error {
-	return removeExistingRegular(target)
-}
-
-func collectInputs(sources []string, archiveAbs string, recursive bool, excludes []string) ([]inputFile, error) {
+func collectInputs(sources []string, archiveAbs string, recursive bool, excludes []string) ([]inputFile, []*security.Root, error) {
 	inputs := make(map[string]inputFile)
+	rootCache := make(map[string]*security.Root)
+	var roots []*security.Root
+	closeError := func(err error) ([]inputFile, []*security.Root, error) {
+		closeInputRoots(roots)
+		return nil, nil, err
+	}
 	for _, source := range sources {
 		matches, err := expandSource(source, recursive)
 		if err != nil {
-			return nil, err
+			return closeError(err)
 		}
 		for _, matched := range matches {
-			if err := collectInput(matched, archiveAbs, inputs); err != nil {
-				return nil, err
+			if err := collectInput(matched, archiveAbs, inputs, rootCache, &roots); err != nil {
+				return closeError(err)
 			}
 		}
 	}
@@ -622,7 +673,7 @@ func collectInputs(sources []string, archiveAbs string, recursive bool, excludes
 	for _, input := range inputs {
 		selected, err := matches(input.name, excludePatterns)
 		if err != nil {
-			return nil, err
+			return closeError(err)
 		}
 		if !selected {
 			continue
@@ -630,7 +681,13 @@ func collectInputs(sources []string, archiveAbs string, recursive bool, excludes
 		result = append(result, input)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].name < result[j].name })
-	return result, nil
+	return result, roots, nil
+}
+
+func closeInputRoots(roots []*security.Root) {
+	for _, root := range roots {
+		_ = root.Close()
+	}
 }
 
 func expandSource(source string, recursive bool) ([]string, error) {
@@ -668,6 +725,9 @@ func wildcardSourceMatches(pattern string, recursive bool) ([]string, error) {
 		}
 		matched := wildcardPathMatch(filepath.ToSlash(relPattern), filepath.ToSlash(rel), recursive)
 		if matched {
+			if len(matches) >= security.MaxArchiveEntries {
+				return fmt.Errorf("input wildcard matches more than %d paths", security.MaxArchiveEntries)
+			}
 			matches = append(matches, name)
 		}
 		return nil
@@ -701,7 +761,7 @@ func wildcardPathMatch(pattern, name string, recursive bool) bool {
 	return true
 }
 
-func collectInput(source, archiveAbs string, inputs map[string]inputFile) error {
+func collectInput(source, archiveAbs string, inputs map[string]inputFile, rootCache map[string]*security.Root, roots *[]*security.Root) error {
 	abs, err := filepath.Abs(source)
 	if err != nil {
 		return err
@@ -715,10 +775,31 @@ func collectInput(source, archiveAbs string, inputs map[string]inputFile) error 
 	}
 	baseName := inputBaseName(source, abs)
 	if !info.IsDir() {
-		return addInput(abs, baseName, info, archiveAbs, inputs)
+		root, err := cachedInputRoot(filepath.Dir(abs), rootCache, roots)
+		if err != nil {
+			return fmt.Errorf("open input parent %q: %w", filepath.Dir(abs), err)
+		}
+		anchored, err := root.Lstat(filepath.Base(abs))
+		if err != nil || !os.SameFile(info, anchored) {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("input %q changed while it was opened", source)
+		}
+		return addInput(abs, baseName, anchored, archiveAbs, inputs, root, filepath.Base(abs))
 	}
-
-	return filepath.WalkDir(abs, func(name string, entry fs.DirEntry, walkErr error) error {
+	root, err := cachedInputRoot(abs, rootCache, roots)
+	if err != nil {
+		return fmt.Errorf("open input directory %q: %w", source, err)
+	}
+	anchored, err := root.Lstat(".")
+	if err != nil || !os.SameFile(info, anchored) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("input directory %q changed while it was opened", source)
+	}
+	return fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -729,22 +810,39 @@ func collectInput(source, archiveAbs string, inputs map[string]inputFile) error 
 		if entryInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symbolic-link input %q is not supported yet", name)
 		}
-		rel, err := filepath.Rel(abs, name)
-		if err != nil {
-			return err
-		}
 		archiveName := baseName
-		if rel != "." {
-			archiveName = path.Join(baseName, filepath.ToSlash(rel))
+		if name != "." {
+			archiveName = path.Join(baseName, name)
 		}
 		if archiveName == "." {
 			return nil
 		}
-		return addInput(name, archiveName, entryInfo, archiveAbs, inputs)
+		display := abs
+		if name != "." {
+			display = filepath.Join(abs, filepath.FromSlash(name))
+		}
+		return addInput(display, archiveName, entryInfo, archiveAbs, inputs, root, name)
 	})
 }
 
-func addInput(name, archiveName string, info fs.FileInfo, archiveAbs string, inputs map[string]inputFile) error {
+func cachedInputRoot(name string, cache map[string]*security.Root, roots *[]*security.Root) (*security.Root, error) {
+	key := filepath.Clean(name)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	if root := cache[key]; root != nil {
+		return root, nil
+	}
+	root, err := security.OpenExistingRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	cache[key] = root
+	*roots = append(*roots, root)
+	return root, nil
+}
+
+func addInput(name, archiveName string, info fs.FileInfo, archiveAbs string, inputs map[string]inputFile, root *security.Root, relative string) error {
 	if !info.Mode().IsRegular() && !info.IsDir() {
 		return fmt.Errorf("special input %q (%s) is not supported", name, info.Mode().Type())
 	}
@@ -760,10 +858,14 @@ func addInput(name, archiveName string, info fs.FileInfo, archiveAbs string, inp
 		return err
 	}
 	key := collisionKey(clean)
-	if previous, exists := inputs[key]; exists && !samePath(previous.path, abs) {
+	previous, exists := inputs[key]
+	if exists && !samePath(previous.path, abs) {
 		return fmt.Errorf("inputs %q and %q have the same archive name %q", previous.path, abs, clean)
 	}
-	inputs[key] = inputFile{path: abs, name: clean, info: info}
+	if !exists && len(inputs) >= security.MaxArchiveEntries {
+		return fmt.Errorf("input contains more than %d entries", security.MaxArchiveEntries)
+	}
+	inputs[key] = inputFile{path: abs, name: clean, info: info, root: root, relative: relative}
 	return nil
 }
 

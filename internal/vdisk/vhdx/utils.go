@@ -1,8 +1,8 @@
 package vhdx
 
 import (
+	"encoding/binary"
 	"unicode/utf16"
-	"unsafe"
 
 	"github.com/google/uuid"
 )
@@ -32,7 +32,7 @@ func utf16ToString(b []byte) string {
 
 	u16s := make([]uint16, len(b)/2)
 	for i := range u16s {
-		u16s[i] = *(*uint16)(unsafe.Pointer(&b[i*2]))
+		u16s[i] = binary.LittleEndian.Uint16(b[i*2:])
 	}
 	return string(utf16.Decode(u16s))
 }

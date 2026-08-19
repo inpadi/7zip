@@ -13,6 +13,47 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if /I "%I7Z_RELEASE_BUILD%"=="1" goto :verify_release_source
+
+echo Building local artifacts from the current worktree.
+echo Set I7Z_RELEASE_BUILD=1 to require a clean, exactly tagged release source.
+goto :source_verified
+
+:verify_release_source
+where git >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: Git was not found on PATH.
+  popd
+  exit /b 1
+)
+
+git diff --quiet -- .
+if errorlevel 1 (
+  echo ERROR: Refusing to build release artifacts from a dirty worktree.
+  popd
+  exit /b 1
+)
+git diff --cached --quiet -- .
+if errorlevel 1 (
+  echo ERROR: Refusing to build release artifacts with staged changes.
+  popd
+  exit /b 1
+)
+git describe --exact-match --tags HEAD >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: Release artifacts must be built from an exact source tag.
+  popd
+  exit /b 1
+)
+
+:source_verified
+
+go mod verify
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
+
 set "OutName=i7z"
 set "BuildArgs=%*"
 set "CGO_ENABLED=0"
@@ -38,8 +79,11 @@ if errorlevel 1 goto :failed
 call :build darwin arm64
 if errorlevel 1 goto :failed
 
+powershell -NoProfile -Command "$root=(Resolve-Path 'Out').Path; Get-ChildItem 'Out' -Recurse -File | Where-Object Name -ne 'SHA256SUMS' | Sort-Object FullName | ForEach-Object { $relative=$_.FullName.Substring($root.Length+1).Replace('\','/'); '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(),$relative } | Set-Content -Encoding ascii 'Out\SHA256SUMS'"
+if errorlevel 1 goto :failed
+
 echo.
-echo All GMS clients were built successfully in "%CD%\Out".
+echo All i7z artifacts were built successfully in "%CD%\Out".
 popd
 exit /b 0
 
@@ -68,8 +112,12 @@ if defined GMS_SKIP_SIGN (
 set "SignScript=%GMS_SIGN_SCRIPT%"
 if not defined SignScript set "SignScript=C:\Users\eh\Documents\GitHub\inpadi-codesign\Sign.cmd"
 if not exist "%SignScript%" (
-  echo Code-signing script not found; leaving %~1 unsigned.
-  exit /b 0
+  if /I not "%I7Z_RELEASE_BUILD%"=="1" (
+    echo Code-signing script not found; leaving local artifact %~1 unsigned.
+    exit /b 0
+  )
+  echo ERROR: Code-signing script not found: %SignScript%
+  exit /b 1
 )
 
 echo Signing %~1
@@ -79,6 +127,6 @@ exit /b %errorlevel%
 :failed
 set "ExitCode=%errorlevel%"
 echo.
-echo ERROR: GMS client build failed with exit code %ExitCode%.
+echo ERROR: i7z build failed with exit code %ExitCode%.
 popd
 exit /b %ExitCode%

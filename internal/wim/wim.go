@@ -6,7 +6,7 @@ package wim
 
 import (
 	"bytes"
-	"crypto/sha1" //nolint:gosec // not used for secure application
+	"crypto/sha1" // #nosec G505 -- SHA-1 is mandated by WIM and is used only for container integrity.
 	"encoding/binary"
 	"encoding/xml"
 	"errors"
@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+
+	"github.com/inpadi/7zip/internal/security"
 )
 
 // File attribute constants from Windows.
@@ -442,6 +444,12 @@ func (r *Reader) resourceReader(hdr *resourceDescriptor) (io.ReadCloser, error) 
 }
 
 func (r *Reader) resourceReaderWithOffset(hdr *resourceDescriptor, offset int64) (io.ReadCloser, error) {
+	if hdr.OriginalSize < 0 || hdr.OriginalSize > security.MaxFileBytes {
+		return nil, fmt.Errorf("WIM resource exceeds the %d-byte expanded-size limit", security.MaxFileBytes)
+	}
+	if offset < 0 || offset > hdr.OriginalSize {
+		return nil, errors.New("WIM resource offset is outside the resource")
+	}
 	var sr io.ReadCloser
 	section := io.NewSectionReader(r.r, hdr.Offset, hdr.CompressedSize())
 	if hdr.Flags()&resFlagCompressed == 0 {
@@ -463,17 +471,27 @@ func (r *Reader) resourceReaderWithOffset(hdr *resourceDescriptor, offset int64)
 }
 
 func (r *Reader) readResource(hdr *resourceDescriptor) ([]byte, error) {
+	if hdr.OriginalSize < 0 || hdr.OriginalSize > security.MaxMetadataBytes {
+		return nil, fmt.Errorf("WIM metadata resource exceeds the %d-byte limit", security.MaxMetadataBytes)
+	}
 	rsrc, err := r.resourceReader(hdr)
 	if err != nil {
 		return nil, err
 	}
 	defer rsrc.Close()
-	return io.ReadAll(rsrc)
+	data, err := io.ReadAll(io.LimitReader(rsrc, security.MaxMetadataBytes+1))
+	if err == nil && len(data) > security.MaxMetadataBytes {
+		err = fmt.Errorf("WIM metadata resource exceeds the %d-byte limit", security.MaxMetadataBytes)
+	}
+	return data, err
 }
 
 func (r *Reader) readXML() (string, error) {
 	if r.hdr.XMLData.CompressedSize() == 0 {
 		return "", nil
+	}
+	if r.hdr.XMLData.OriginalSize < 2 || r.hdr.XMLData.OriginalSize%2 != 0 || r.hdr.XMLData.OriginalSize > security.MaxMetadataBytes {
+		return "", &ParseError{Oper: "XML data", Err: errors.New("invalid XML resource size")}
 	}
 	rsrc, err := r.resourceReader(&r.hdr.XMLData)
 	if err != nil {
@@ -505,6 +523,9 @@ func (r *Reader) readOffsetTable(res *resourceDescriptor) (map[SHA1Hash]resource
 
 	br := bytes.NewReader(offsetTable)
 	for i := 0; ; i++ {
+		if i >= security.MaxMetadataItems {
+			return nil, nil, &ParseError{Oper: "offset table", Err: errors.New("too many resource descriptors")}
+		}
 		var res streamDescriptor
 		err := binary.Read(br, binary.LittleEndian, &res)
 		if err == io.EOF { //nolint:errorlint
@@ -516,6 +537,9 @@ func (r *Reader) readOffsetTable(res *resourceDescriptor) (map[SHA1Hash]resource
 		if res.Flags()&^supportedResFlags != 0 {
 			return nil, nil, &ParseError{Oper: "offset table", Err: errors.New("unsupported resource flag")}
 		}
+		if res.OriginalSize < 0 || res.OriginalSize > security.MaxFileBytes {
+			return nil, nil, &ParseError{Oper: "offset table", Err: errors.New("resource expanded size exceeds limit")}
+		}
 
 		// Validation for ad-hoc testing
 		if validate {
@@ -523,7 +547,7 @@ func (r *Reader) readOffsetTable(res *resourceDescriptor) (map[SHA1Hash]resource
 			if err != nil {
 				panic(fmt.Sprint(i, err))
 			}
-			hash := sha1.New() //nolint:gosec // not used for secure application
+			hash := sha1.New() // #nosec G401 -- SHA-1 is mandated by WIM and is not used for trust decisions.
 			_, err = io.Copy(hash, sec)
 			sec.Close()
 			if err != nil {
@@ -562,6 +586,9 @@ func (*Reader) readSecurityDescriptors(rsrc io.Reader) (sds [][]byte, n int64, e
 	}
 
 	n += securityblockDiskSize
+	if secBlock.NumEntries > security.MaxArchiveEntries || secBlock.TotalLength > security.MaxMetadataBytes {
+		return nil, n, &ParseError{Oper: "security table", Err: errors.New("security table exceeds metadata limits")}
+	}
 
 	secSizes := make([]int64, secBlock.NumEntries)
 	err = binary.Read(rsrc, binary.LittleEndian, &secSizes)
@@ -573,7 +600,11 @@ func (*Reader) readSecurityDescriptors(rsrc io.Reader) (sds [][]byte, n int64, e
 
 	sds = make([][]byte, secBlock.NumEntries)
 	for i, size := range secSizes {
-		sd := make([]byte, size&0xffffffff)
+		descriptorSize := size & 0xffffffff
+		if size < 0 || descriptorSize > security.MaxMetadataBytes || n > security.MaxMetadataBytes-descriptorSize {
+			return nil, n, &ParseError{Oper: "security descriptor", Err: errors.New("security descriptor exceeds metadata limits")}
+		}
+		sd := make([]byte, descriptorSize)
 		_, err = io.ReadFull(rsrc, sd)
 		if err != nil {
 			return sds, n, &ParseError{Oper: "security descriptor", Err: err}
@@ -588,7 +619,7 @@ func (*Reader) readSecurityDescriptors(rsrc io.Reader) (sds [][]byte, n int64, e
 		return sds, n, nil
 	}
 
-	secsize := int64((secBlock.TotalLength + 7) &^ 7)
+	secsize := (int64(secBlock.TotalLength) + 7) &^ 7
 	if n > secsize {
 		return sds, n, &ParseError{
 			Oper: "security descriptor",
@@ -680,6 +711,10 @@ func (img *Image) readdir(offset int64) ([]*File, error) {
 			return nil, err
 		}
 		entries = append(entries, e)
+		if len(entries) > security.MaxArchiveEntries {
+			img.reset()
+			return nil, errors.New("WIM directory contains too many entries")
+		}
 	}
 	return entries, nil
 }
@@ -693,6 +728,9 @@ func (img *Image) readNextEntry(r io.Reader) (*File, int64, error) {
 
 	if length == 0 {
 		return nil, 8, io.EOF
+	}
+	if length < 0 || length > security.MaxMetadataBytes {
+		return nil, 0, &ParseError{Oper: "directory entry", Err: errors.New("entry size exceeds metadata limits")}
 	}
 
 	left := length
@@ -708,7 +746,10 @@ func (img *Image) readNextEntry(r io.Reader) (*File, int64, error) {
 
 	left -= direntrySize
 
-	namesLen := int64(dentry.FileNameLength + 2 + dentry.ShortNameLength)
+	if dentry.FileNameLength%2 != 0 || dentry.ShortNameLength%2 != 0 {
+		return nil, 0, &ParseError{Oper: "directory entry", Err: errors.New("invalid UTF-16 name length")}
+	}
+	namesLen := int64(dentry.FileNameLength) + 2 + int64(dentry.ShortNameLength)
 	if left < namesLen {
 		return nil, 0, &ParseError{Oper: "directory entry", Err: errors.New("size too short for names")}
 	}
@@ -780,6 +821,9 @@ func (img *Image) readNextEntry(r io.Reader) (*File, int64, error) {
 	}
 
 	if dentry.SecurityID != 0xffffffff {
+		if uint64(dentry.SecurityID) >= uint64(len(img.sds)) {
+			return nil, 0, &ParseError{Oper: "directory entry", Path: name, Err: errors.New("invalid security descriptor index")}
+		}
 		f.SecurityDescriptor = img.sds[dentry.SecurityID]
 	}
 
@@ -833,6 +877,9 @@ func (img *Image) readNextStream(r io.Reader) (*Stream, int64, error) {
 	}
 
 	left := length
+	if length < 0 || length > security.MaxMetadataBytes {
+		return nil, 0, &ParseError{Oper: "stream entry", Err: errors.New("entry size exceeds metadata limits")}
+	}
 	if left < streamentrySize {
 		return nil, 0, &ParseError{Oper: "stream entry", Err: errors.New("size too short")}
 	}
@@ -845,7 +892,7 @@ func (img *Image) readNextStream(r io.Reader) (*Stream, int64, error) {
 
 	left -= streamentrySize
 
-	if left < int64(sentry.NameLength) {
+	if sentry.NameLength%2 != 0 || left < int64(sentry.NameLength) {
 		return nil, 0, &ParseError{Oper: "stream entry", Err: errors.New("size too short for name")}
 	}
 

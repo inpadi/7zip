@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/ulikunitz/xz/lzma"
 )
 
@@ -57,7 +58,7 @@ func NewReader(p []byte, s uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 	h := bytes.NewBuffer(p)
 	_ = binary.Write(h, binary.LittleEndian, s)
 
-	lr, err := lzma.NewReader(multiReader(h, readers[0]))
+	lr, err := (lzma.ReaderConfig{DictCap: security.MaxDecoderMemory}).NewReader(multiReader(h, readers[0]))
 	if err != nil {
 		return nil, fmt.Errorf("lzma: error creating reader: %w", err)
 	}

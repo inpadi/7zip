@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/wim/lzx"
 	"github.com/inpadi/7zip/internal/wim/xpress"
 )
@@ -32,6 +33,9 @@ type compressedReader struct {
 func newCompressedReader(r *io.SectionReader, originalSize int64, offset int64, method compressionMethod) (*compressedReader, error) {
 	if originalSize <= 0 {
 		return nil, errors.New("compressed WIM resource has invalid original size")
+	}
+	if originalSize > security.MaxFileBytes {
+		return nil, fmt.Errorf("compressed WIM resource exceeds the %d-byte output limit", security.MaxFileBytes)
 	}
 	nchunks := (originalSize + chunkSize - 1) / chunkSize
 	var base int64
@@ -113,6 +117,9 @@ func (r *compressedReader) uncompressedSize(n int) int {
 }
 
 func (r *compressedReader) reset(n int) error {
+	if n < 0 {
+		return errors.New("invalid negative WIM chunk index")
+	}
 	if n >= len(r.chunks) {
 		return io.EOF
 	}
@@ -122,8 +129,8 @@ func (r *compressedReader) reset(n int) error {
 	r.curChunk = n
 	size := r.chunkSize(n)
 	uncompressedSize := r.uncompressedSize(n)
-	if size <= 0 {
-		return errors.New("invalid empty WIM chunk")
+	if size <= 0 || size > chunkSize {
+		return errors.New("invalid WIM compressed chunk size")
 	}
 	section := io.NewSectionReader(r.r, r.chunkOffset(n), int64(size))
 	if size != uncompressedSize {

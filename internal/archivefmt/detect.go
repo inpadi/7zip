@@ -3,7 +3,8 @@ package archivefmt
 import (
 	"bytes"
 	"io"
-	"os"
+
+	"github.com/inpadi/7zip/internal/security"
 )
 
 const signatureProbeSize = 16*2048 + 6
@@ -44,7 +45,7 @@ func matchingTarStream(inferred, detected Format) bool {
 }
 
 func detectFormat(name string) (Format, bool, error) {
-	file, err := os.Open(name)
+	file, _, err := security.OpenRegularFile(name)
 	if err != nil {
 		return "", false, err
 	}
