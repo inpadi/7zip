@@ -104,6 +104,40 @@ func Add(archive string, sources []string) (result Result, err error) {
 	return AddWithOptions(archive, sources, AddOptions{Solid: true})
 }
 
+// CreateEmptyWithOptions creates a valid 7z archive containing no entries.
+func CreateEmptyWithOptions(archive string, options AddOptions) (err error) {
+	output, err := security.CreateOutput(archive)
+	if err != nil {
+		return err
+	}
+	defer output.Cleanup()
+
+	level := -1
+	if options.LevelDefined {
+		level = options.Level
+	}
+	writer, err := newWriter(output.File(), writerOptions{
+		solid:            options.Solid,
+		password:         options.Password,
+		headerEncryption: options.HeaderEncryption,
+		level:            level,
+		method:           options.Method,
+	})
+	if err != nil {
+		return fmt.Errorf("create 7z writer: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("finish archive: %w", err)
+	}
+	if err := output.File().Sync(); err != nil {
+		return fmt.Errorf("sync archive: %w", err)
+	}
+	if err := output.CloseFile(); err != nil {
+		return fmt.Errorf("close archive: %w", err)
+	}
+	return output.Publish()
+}
+
 // AddWithOptions creates a new archive or transactionally rewrites an existing
 // archive while replacing entries supplied by sources.
 func AddWithOptions(archive string, sources []string, options AddOptions) (result Result, err error) {

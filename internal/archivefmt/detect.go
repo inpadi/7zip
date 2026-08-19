@@ -9,10 +9,10 @@ import (
 
 const signatureProbeSize = 16*2048 + 6
 
-// resolveInput uses strong archive signatures when no type was explicitly set.
-// Extensions remain useful for formats whose outer compression stream does not
-// reveal whether its payload is a tar archive.
-func resolveInput(explicit, archive string) (Format, error) {
+// ResolveInput determines an existing archive's format, preferring a strong
+// file signature over its extension when no explicit format is supplied.
+// Extensions remain useful for compression streams whose payload may be tar.
+func ResolveInput(explicit, archive string) (Format, error) {
 	if explicit != "" {
 		return Resolve(explicit, archive)
 	}
@@ -35,6 +35,10 @@ func resolveInput(explicit, archive string) (Format, error) {
 		return "", extensionErr
 	}
 	return inferred, nil
+}
+
+func resolveInput(explicit, archive string) (Format, error) {
+	return ResolveInput(explicit, archive)
 }
 
 func matchingTarStream(inferred, detected Format) bool {

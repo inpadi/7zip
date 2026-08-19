@@ -93,6 +93,67 @@ cat payload.bin | 7zip-go a -sidata.bin -so -t7z archive.7z > streamed.7z
 7zip-go x -ooutput archive.7z
 ```
 
+## Go library
+
+Import the module as `sevenzip` to open an archive as a staged read-write
+filesystem. Archive paths follow `io/fs` conventions and always use forward
+slashes. `Close` transactionally rebuilds a changed archive; `Discard` closes
+it without publishing staged changes.
+
+```go
+package main
+
+import (
+	"log"
+	"os"
+
+	sevenzip "github.com/inpadi/7zip"
+)
+
+func main() {
+	archive, err := sevenzip.Open("assets.7z", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := archive.MkdirAll("images", 0o755); err != nil {
+		_ = archive.Discard()
+		log.Fatal(err)
+	}
+	if err := archive.WriteFile("images/index.txt", []byte("updated\n"), 0o644); err != nil {
+		_ = archive.Discard()
+		log.Fatal(err)
+	}
+	file, err := archive.OpenFile("events.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		_ = archive.Discard()
+		log.Fatal(err)
+	}
+	if _, err := file.WriteString("archive updated\n"); err != nil {
+		_ = archive.Discard()
+		log.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = archive.Discard()
+		log.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Use `sevenzip.Create` instead of `Open` for a new archive. `Archive` implements
+`fs.FS`, `fs.ReadFileFS`, `fs.ReadDirFS`, and `fs.StatFS`, and also provides
+`Create`, `OpenFile`, `WriteFile`, `Mkdir`, `MkdirAll`, `Remove`, `RemoveAll`,
+`Rename`, `Chmod`, and `Chtimes`. Set `Options.ReadOnly` when no mutations
+should be allowed. ISO, WIM, VHD, and VHDX archives are always read-only.
+
+The filesystem is materialized in a private temporary directory while open,
+so available disk space must cover the extracted contents and the rebuilt
+archive. Single-stream gzip, bzip2, XZ, and Zstandard files must contain exactly
+one regular file when closed.
+
 ## Remaining CLI scope
 
 The original project has more archive handlers and mutation commands than this milestone. RAR, CAB, RPM, DEB, and other upstream formats are not yet claimed. Delete, rename, multi-volume output, SFX, per-rule recursion modes, interactive prompts, and byte-identical output for commands other than `l -ba` remain.

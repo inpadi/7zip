@@ -51,6 +51,23 @@ func (o *Output) File() *os.File { return o.file }
 
 func (o *Output) Existed() bool { return o.existing != nil }
 
+// ValidateExisting verifies that the destination observed by CreateOutput is
+// the same file state that a caller previously read. Publish performs another
+// identity check to cover changes made after this validation.
+func (o *Output) ValidateExisting(expected fs.FileInfo) error {
+	if expected == nil {
+		if o.existing != nil {
+			return fmt.Errorf("archive output %q appeared while it was open", o.target)
+		}
+		return nil
+	}
+	if o.existing == nil || !os.SameFile(expected, o.existing) ||
+		expected.Size() != o.existing.Size() || !expected.ModTime().Equal(o.existing.ModTime()) {
+		return fmt.Errorf("archive output %q changed while it was open", o.target)
+	}
+	return nil
+}
+
 func (o *Output) CloseFile() error {
 	if o.file == nil {
 		return nil

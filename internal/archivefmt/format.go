@@ -2,6 +2,7 @@
 package archivefmt
 
 import (
+	"archive/zip"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 )
 
 type Entry = archive7z.Entry
@@ -73,6 +75,14 @@ func Resolve(explicit, archive string) (Format, error) {
 			return FormatZip, nil
 		case "tar":
 			return FormatTar, nil
+		case "tar.gzip", "tar.gz", "tgz":
+			return FormatTarGzip, nil
+		case "tar.bzip2", "tar.bz2", "tbz2":
+			return FormatTarBzip2, nil
+		case "tar.xz", "txz":
+			return FormatTarXZ, nil
+		case "tar.zstd", "tar.zst", "tzst":
+			return FormatTarZstd, nil
 		case "gzip", "gz":
 			return FormatGzip, nil
 		case "bzip2", "bz2":
@@ -172,6 +182,67 @@ func Add(archive string, sources []string, options AddOptions) (Result, error) {
 	default:
 		return addTar(archive, sources, format, level, options.Recursive, options.Excludes)
 	}
+}
+
+// CreateEmpty creates an empty archive. Single-stream compression formats do
+// not have an empty filesystem representation and require one regular file.
+func CreateEmpty(archive string, options AddOptions) (err error) {
+	format, err := Resolve(options.Format, archive)
+	if err != nil {
+		return err
+	}
+	if format != Format7z && (options.Password != "" || options.HeaderEncryption) {
+		return fmt.Errorf("password encryption is not implemented for %s archives", format)
+	}
+	if err := validateCompression(format, options.Method); err != nil {
+		return err
+	}
+	if isSingleStream(format) {
+		return fmt.Errorf("%s is a single-stream format and requires exactly one regular input file", format)
+	}
+	if format == FormatISO || format == FormatWIM || format == FormatVHD || format == FormatVHDX {
+		return fmt.Errorf("%s creation is not implemented; this format is currently read-only", format)
+	}
+	if format == Format7z {
+		return archive7z.CreateEmptyWithOptions(archive, archive7z.AddOptions{
+			Solid:            options.Solid,
+			Password:         options.Password,
+			HeaderEncryption: options.HeaderEncryption,
+			Level:            options.Level,
+			LevelDefined:     options.LevelDefined,
+			Method:           options.Method,
+		})
+	}
+
+	output, err := security.CreateOutput(archive)
+	if err != nil {
+		return err
+	}
+	defer output.Cleanup()
+	if format == FormatZip {
+		writer := zip.NewWriter(output.File())
+		err = writer.Close()
+	} else {
+		level := -1
+		if options.LevelDefined {
+			level = options.Level
+		}
+		var writer *tarOutput
+		writer, err = newTarOutput(output.File(), format, level)
+		if err == nil {
+			err = writer.close()
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := output.File().Sync(); err != nil {
+		return err
+	}
+	if err := output.CloseFile(); err != nil {
+		return err
+	}
+	return output.Publish()
 }
 
 func BuildPatterns(includes, excludes []string, recursive bool) []string {
