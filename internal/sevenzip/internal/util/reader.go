@@ -1,7 +1,12 @@
 // Package util implements various utility types and interfaces.
 package util
 
-import "io"
+import (
+	"bufio"
+	"io"
+)
+
+const byteReaderBufferSize = 64 * 1024
 
 // SizeReadSeekCloser is an io.Reader, io.Seeker, and io.Closer with a Size
 // method.
@@ -40,29 +45,26 @@ func NopCloser(r Reader) ReadCloser {
 
 type byteReadCloser struct {
 	io.ReadCloser
+	reader *bufio.Reader
+}
+
+func (rc *byteReadCloser) Read(p []byte) (int, error) {
+	return rc.reader.Read(p) //nolint:wrapcheck
 }
 
 func (rc *byteReadCloser) ReadByte() (byte, error) {
-	var b [1]byte
-
-	n, err := rc.Read(b[:])
-	if err != nil {
-		return 0, err //nolint:wrapcheck
-	}
-
-	if n == 0 {
-		return 0, io.ErrNoProgress
-	}
-
-	return b[0], nil
+	return rc.reader.ReadByte() //nolint:wrapcheck
 }
 
-// ByteReadCloser returns a ReadCloser either by returning the io.ReadCloser
-// r if it implements the interface, or wrapping it with a ReadByte method.
+// ByteReadCloser returns r unchanged when it already implements ReadCloser.
+// Otherwise it adds buffered Read and ReadByte methods while preserving Close.
 func ByteReadCloser(r io.ReadCloser) ReadCloser {
 	if rc, ok := r.(ReadCloser); ok {
 		return rc
 	}
 
-	return &byteReadCloser{r}
+	return &byteReadCloser{
+		ReadCloser: r,
+		reader:     bufio.NewReaderSize(r, byteReaderBufferSize),
+	}
 }

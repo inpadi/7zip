@@ -384,6 +384,57 @@ func TestUpstreamInteroperability(t *testing.T) {
 	})
 }
 
+func TestUpstreamCoderChains(t *testing.T) {
+	upstream := findUpstream7z(t)
+	root := t.TempDir()
+	payload := bytes.Repeat([]byte{
+		0x90, 0xe8, 0, 0, 0, 0, 0x90, 0xe9, 0, 0, 0, 0,
+	}, 64*1024)
+	mustWriteFile(t, filepath.Join(root, "payload.bin"), payload)
+
+	for _, test := range []struct {
+		name     string
+		methods  []string
+		password string
+	}{
+		{
+			name:     "AES_Deflate",
+			methods:  []string{"-m0=Deflate", "-mhe=on", "-psecret"},
+			password: "secret",
+		},
+		{
+			name: "BCJ2_LZMA2",
+			methods: []string{
+				"-m0=BCJ2", "-m1=LZMA2", "-m2=LZMA2", "-m3=LZMA2",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			archive := filepath.Join(root, test.name+".7z")
+			args := []string{"a", "-bd", "-y", "-t7z"}
+			args = append(args, test.methods...)
+			args = append(args, archive, "payload.bin")
+			command := exec.Command(upstream, args...)
+			command.Dir = root
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("upstream create failed: %v\n%s", err, output)
+			}
+
+			var decoded bytes.Buffer
+			result, err := WriteContents(archive, test.password, nil, &decoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Files != 1 || result.Bytes != uint64(len(payload)) {
+				t.Fatalf("WriteContents result = %#v", result)
+			}
+			if !bytes.Equal(decoded.Bytes(), payload) {
+				t.Fatal("decoded payload differs from input")
+			}
+		})
+	}
+}
+
 func findUpstream7z(t *testing.T) string {
 	t.Helper()
 	for _, name := range []string{"7z", "7zz", "7za"} {

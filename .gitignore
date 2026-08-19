@@ -5,8 +5,6 @@
 /7zip.exe
 /7zip-go
 /7zip-go.exe
-/Out/linux/
-/Out/darwin/
 
 # Test and profiling artifacts
 /*.cover

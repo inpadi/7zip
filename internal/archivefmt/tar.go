@@ -41,12 +41,13 @@ func openTar(archive string, format Format) (*tarInput, error) {
 	case FormatTarBzip2:
 		reader = bzip2.NewReader(file)
 	case FormatTarXZ:
-		compressed, xzErr := xz.NewReader(file)
+		compressed, xzErr := newXZReader(file)
 		if xzErr != nil {
 			_ = file.Close()
 			return nil, xzErr
 		}
 		reader = compressed
+		closeCompression = compressed.Close
 	case FormatTarZstd:
 		compressed, zstdErr := zstd.NewReader(file)
 		if zstdErr != nil {
