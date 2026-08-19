@@ -8,15 +8,16 @@ does not replace or narrow any existing copyright or license notice.
 
 7-Zip Copyright (C) 1999-2026 Igor Pavlov.
 
-The original 7-Zip sources in `C/`, `CPP/`, `Asm/`, and `DOC/`, together with
-any portions of this port derived or translated from those sources, remain
-under the licenses assigned by the upstream project. Most such code is free
-software under the GNU Lesser General Public License, version 2.1 or, at your
-option, any later version. Some files instead use BSD licenses, public-domain
-terms, or the GNU LGPL together with the unRAR restriction.
+The retained original 7-Zip documentation in `DOC/`, together with any
+portions of this port derived or translated from upstream 7-Zip sources,
+remain under the licenses assigned by the upstream project. Most such code is
+free software under the GNU Lesser General Public License, version 2.1 or, at
+your option, any later version. Some upstream material instead uses BSD
+licenses, public-domain terms, or the GNU LGPL together with the unRAR
+restriction.
 
 The authoritative upstream license allocation and license texts are retained
-in:
+for the documentation and derived portions in:
 
 - `DOC/License.txt`
 - `DOC/copying.txt`

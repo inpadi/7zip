@@ -14,7 +14,8 @@ port.
 The port contributors gratefully thank Igor Pavlov, the original developer of
 7-Zip, for his excellent work and for making 7-Zip available as free software.
 The design, documentation, and long-running development of 7-Zip made this
-port possible.
+port possible. The legacy native reference source trees are not distributed
+as part of this repository.
 
 See `LICENSE` and the notices referenced there for the terms that apply to each
 part of the repository.
