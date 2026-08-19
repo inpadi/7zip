@@ -5,13 +5,13 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	dsnetbzip2 "github.com/dsnet/compress/bzip2"
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
@@ -26,10 +26,11 @@ func isSingleStream(format Format) bool {
 }
 
 func addStream(archive string, sourceNames []string, format Format, level int, recursive bool, excludes []string) (result Result, err error) {
-	sources, err := collectSources(sourceNames, archive, recursive)
+	sources, roots, err := collectSources(sourceNames, archive, recursive)
 	if err != nil {
 		return result, err
 	}
+	defer closeSourceRoots(roots)
 	sources, err = filterSources(sources, excludes, recursive)
 	if err != nil {
 		return result, err
@@ -44,28 +45,12 @@ func addStream(archive string, sourceNames []string, format Format, level int, r
 		return result, fmt.Errorf("%s is a single-stream format and requires exactly one regular input file", format)
 	}
 	source := regular[0]
-	existed, err := archiveExists(archive)
+	output, err := security.CreateOutput(archive)
 	if err != nil {
 		return result, err
 	}
-	absolute, err := filepath.Abs(archive)
-	if err != nil {
-		return result, err
-	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
-		return result, err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(absolute), ".stream-go-*.tmp")
-	if err != nil {
-		return result, err
-	}
-	tempName := temp.Name()
-	defer func() {
-		_ = temp.Close()
-		if err != nil {
-			_ = os.Remove(tempName)
-		}
-	}()
+	defer output.Cleanup()
+	temp := output.File()
 
 	var compressed io.WriteCloser
 	switch format {
@@ -99,11 +84,17 @@ func addStream(archive string, sourceNames []string, format Format, level int, r
 	if err != nil {
 		return result, err
 	}
-	src, err := os.Open(source.path)
+	src, err := source.open()
 	if err != nil {
 		return result, err
 	}
-	n, copyErr := io.Copy(compressed, src)
+	var budget security.Budget
+	if err := budget.AddEntry(source.name, uint64(max(source.info.Size(), 0))); err != nil {
+		_ = src.Close()
+		_ = compressed.Close()
+		return result, err
+	}
+	n, copyErr := budget.Copy(compressed, src, source.name)
 	closeSourceErr := src.Close()
 	closeCompressionErr := compressed.Close()
 	if copyErr != nil {
@@ -118,10 +109,10 @@ func addStream(archive string, sourceNames []string, format Format, level int, r
 	if err = temp.Sync(); err != nil {
 		return result, err
 	}
-	if err = temp.Close(); err != nil {
+	if err = output.CloseFile(); err != nil {
 		return result, err
 	}
-	if err = publish(tempName, absolute, existed); err != nil {
+	if err = output.Publish(); err != nil {
 		return result, err
 	}
 	return Result{Files: 1, Bytes: uint64(n)}, nil
@@ -150,19 +141,20 @@ func zstdLevel(level int) int {
 }
 
 type streamInput struct {
-	reader   io.Reader
-	close    func() error
-	name     string
-	modified time.Time
+	reader     io.Reader
+	close      func() error
+	name       string
+	modified   time.Time
+	compressed int64
 }
 
 func openStream(archive string, format Format) (*streamInput, error) {
-	file, err := os.Open(archive)
+	file, info, err := security.OpenRegularFile(archive)
 	if err != nil {
 		return nil, err
 	}
 	name := streamEntryName(archive, format)
-	input := &streamInput{reader: file, name: name, close: file.Close}
+	input := &streamInput{reader: file, name: name, close: file.Close, compressed: info.Size()}
 	switch format {
 	case FormatGzip:
 		reader, gzipErr := gzip.NewReader(file)
@@ -207,7 +199,12 @@ func openStream(archive string, format Format) (*streamInput, error) {
 			return fileErr
 		}
 	case FormatZstd:
-		reader, zstdErr := zstd.NewReader(file)
+		reader, zstdErr := zstd.NewReader(file,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(security.MaxDecoderMemory),
+			zstd.WithDecoderMaxWindow(security.MaxDecoderMemory),
+			zstd.WithDecoderLowmem(true),
+		)
 		if zstdErr != nil {
 			_ = file.Close()
 			return nil, zstdErr
@@ -248,7 +245,12 @@ func listStream(archive string, patterns []string, format Format) ([]Entry, erro
 	if err != nil || !selected {
 		return nil, err
 	}
-	n, err := io.Copy(io.Discard, input.reader)
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
+	if err := budget.AddEntry(input.name, 0); err != nil {
+		return nil, err
+	}
+	n, err := budget.Copy(io.Discard, input.reader, input.name)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +267,12 @@ func testStream(archive string, patterns []string, format Format) (Result, error
 	if err != nil || !selected {
 		return Result{}, err
 	}
-	n, err := io.Copy(io.Discard, input.reader)
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
+	if err := budget.AddEntry(input.name, 0); err != nil {
+		return Result{}, err
+	}
+	n, err := budget.Copy(io.Discard, input.reader, input.name)
 	if err != nil {
 		return Result{}, err
 	}
@@ -282,7 +289,12 @@ func writeStream(archive string, patterns []string, format Format, dst io.Writer
 	if err != nil || !selected {
 		return Result{}, err
 	}
-	n, err := io.Copy(dst, input.reader)
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
+	if err := budget.AddEntry(input.name, 0); err != nil {
+		return Result{}, err
+	}
+	n, err := budget.Copy(dst, input.reader, input.name)
 	if err != nil {
 		return Result{}, err
 	}
@@ -294,6 +306,7 @@ func extractStream(archive string, options ExtractOptions, format Format) (Resul
 	if err != nil {
 		return Result{}, err
 	}
+	defer root.Close()
 	input, err := openStream(archive, format)
 	if err != nil {
 		return Result{}, err
@@ -303,7 +316,9 @@ func extractStream(archive string, options ExtractOptions, format Format) (Resul
 	if err != nil || !selected {
 		return Result{}, err
 	}
-	n, wrote, err := extractEntry(root, input.name, 0o644, input.modified, input.reader, options, make(map[string]string))
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
+	n, wrote, err := extractEntry(root, input.name, 0o644, 0, input.reader, options, make(map[string]string), &budget)
 	if err != nil {
 		return Result{}, err
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bodgit/plumbing"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/sevenzip/internal/util"
 )
 
@@ -225,7 +226,10 @@ func (si *streamsInfo) Folders() int {
 	return 0
 }
 
-func (si *streamsInfo) FileFolderAndSize(file int) (int, uint64, uint32) {
+func (si *streamsInfo) FileFolderAndSize(file int) (int, uint64, uint32, error) {
+	if file < 0 || si == nil || si.unpackInfo == nil {
+		return 0, 0, 0, errors.New("sevenzip: invalid file stream index")
+	}
 	var (
 		folder  int
 		streams uint64 = 1
@@ -234,28 +238,91 @@ func (si *streamsInfo) FileFolderAndSize(file int) (int, uint64, uint32) {
 
 	if si.subStreamsInfo != nil {
 		total := uint64(0)
-
+		found := false
 		for folder, streams = range si.subStreamsInfo.streams {
 			total += streams
 			if uint64(file) < total { //nolint:gosec
+				found = true
 				break
 			}
 		}
-
+		if !found {
+			return 0, 0, 0, errors.New("sevenzip: file stream index exceeds substreams")
+		}
 		if len(si.subStreamsInfo.digest) > 0 {
+			if file >= len(si.subStreamsInfo.digest) {
+				return 0, 0, 0, errors.New("sevenzip: missing substream checksum")
+			}
 			crc = si.subStreamsInfo.digest[file]
 		}
+	} else {
+		folder = file
 	}
-
+	if folder < 0 || folder >= len(si.unpackInfo.folder) {
+		return 0, 0, 0, errors.New("sevenzip: file stream references an invalid folder")
+	}
 	if streams == 1 {
 		if len(si.unpackInfo.digest) > 0 {
+			if folder >= len(si.unpackInfo.digest) {
+				return 0, 0, 0, errors.New("sevenzip: missing folder checksum")
+			}
 			crc = si.unpackInfo.digest[folder]
 		}
-
-		return folder, si.unpackInfo.folder[folder].size[len(si.unpackInfo.folder[folder].coder)-1], crc
+		return folder, si.unpackInfo.folder[folder].unpackSize(), crc, nil
 	}
+	if file >= len(si.subStreamsInfo.size) {
+		return 0, 0, 0, errors.New("sevenzip: missing substream size")
+	}
+	return folder, si.subStreamsInfo.size[file], crc, nil
+}
 
-	return folder, si.subStreamsInfo.size[file], crc
+func (si *streamsInfo) validate() error {
+	if si == nil {
+		return nil
+	}
+	if si.packInfo == nil || si.unpackInfo == nil {
+		if si.packInfo == nil && si.unpackInfo == nil && si.subStreamsInfo == nil {
+			return nil
+		}
+		return errors.New("sevenzip: incomplete streams metadata")
+	}
+	packed := uint64(0)
+	for _, folder := range si.unpackInfo.folder {
+		if folder == nil || len(folder.coder) == 0 || len(folder.size) == 0 || folder.unpackSize() > uint64(security.MaxTotalBytes) {
+			return errors.New("sevenzip: invalid folder metadata")
+		}
+		if packed > security.MaxMetadataItems-folder.packedStreams {
+			return errors.New("sevenzip: too many packed streams")
+		}
+		packed += folder.packedStreams
+	}
+	if packed != uint64(len(si.packInfo.size)) || si.packInfo.streams != packed {
+		return errors.New("sevenzip: packed stream counts do not match")
+	}
+	if len(si.packInfo.digest) != 0 && len(si.packInfo.digest) != len(si.packInfo.size) {
+		return errors.New("sevenzip: packed stream checksum count does not match")
+	}
+	if len(si.unpackInfo.digest) != 0 && len(si.unpackInfo.digest) != len(si.unpackInfo.folder) {
+		return errors.New("sevenzip: folder checksum count does not match")
+	}
+	if si.subStreamsInfo != nil {
+		if len(si.subStreamsInfo.streams) != len(si.unpackInfo.folder) {
+			return errors.New("sevenzip: substream folder count does not match")
+		}
+		files := uint64(0)
+		multi := false
+		for _, count := range si.subStreamsInfo.streams {
+			files += count
+			multi = multi || count > 1
+		}
+		if multi && uint64(len(si.subStreamsInfo.size)) != files {
+			return errors.New("sevenzip: substream size count does not match")
+		}
+		if len(si.subStreamsInfo.digest) != 0 && uint64(len(si.subStreamsInfo.digest)) != files {
+			return errors.New("sevenzip: substream checksum count does not match")
+		}
+	}
+	return nil
 }
 
 func (si *streamsInfo) folderOffset(folder int) int64 {
@@ -274,6 +341,12 @@ func (si *streamsInfo) folderOffset(folder int) int64 {
 
 //nolint:cyclop,funlen,lll
 func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string, checksum bool) (*folderReadCloser, uint32, bool, error) {
+	if err := si.validate(); err != nil {
+		return nil, 0, false, err
+	}
+	if folder < 0 || folder >= len(si.unpackInfo.folder) {
+		return nil, 0, false, errors.New("sevenzip: invalid folder index")
+	}
 	f := si.unpackInfo.folder[folder]
 	in := make([]io.ReadCloser, f.in)
 	out := make([]io.ReadCloser, f.out)
@@ -282,10 +355,16 @@ func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string, 
 	for i := range folder {
 		packedOffset += len(si.unpackInfo.folder[i].packed)
 	}
+	if packedOffset > len(si.packInfo.size)-len(f.packed) {
+		return nil, 0, false, errors.New("sevenzip: packed stream index exceeds metadata")
+	}
 
 	offset := int64(0)
 
 	for i, input := range f.packed {
+		if input >= uint64(len(in)) {
+			return nil, 0, false, errors.New("sevenzip: packed input index exceeds folder inputs")
+		}
 		size := int64(si.packInfo.size[packedOffset+i]) //nolint:gosec
 		in[input] = util.NopCloser(bufio.NewReader(io.NewSectionReader(r, si.folderOffset(folder)+offset, size)))
 		offset += size
@@ -301,13 +380,16 @@ func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string, 
 			return nil, 0, hasEncryption, errMultipleOutputStreams
 		}
 
+		if input+c.in > uint64(len(in)) || output+c.out > uint64(len(out)) {
+			return nil, 0, hasEncryption, errors.New("sevenzip: coder stream indexes exceed folder metadata")
+		}
 		for j := input; j < input+c.in; j++ {
 			if in[j] != nil {
 				continue
 			}
 
 			bp := f.findInBindPair(j)
-			if bp == nil || out[bp.out] == nil {
+			if bp == nil || bp.out >= uint64(len(out)) || out[bp.out] == nil {
 				return nil, 0, hasEncryption, errNoBoundStream
 			}
 

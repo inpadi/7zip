@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"strconv"
 	"strings"
 	"unicode/utf16"
+
+	"github.com/inpadi/7zip/internal/security"
 )
 
 // Command identifies an archive operation.
@@ -288,16 +290,33 @@ func expandListFiles(values []string, charset string) ([]string, error) {
 	var expanded []string
 	for _, value := range values {
 		if strings.HasPrefix(value, "@@") {
+			if len(expanded) >= security.MaxArchiveEntries {
+				return nil, fmt.Errorf("command contains more than %d path entries", security.MaxArchiveEntries)
+			}
 			expanded = append(expanded, value[1:])
 			continue
 		}
 		if !strings.HasPrefix(value, "@") || len(value) == 1 {
+			if len(expanded) >= security.MaxArchiveEntries {
+				return nil, fmt.Errorf("command contains more than %d path entries", security.MaxArchiveEntries)
+			}
 			expanded = append(expanded, value)
 			continue
 		}
-		content, err := os.ReadFile(value[1:])
+		file, _, err := security.OpenRegularFile(value[1:])
 		if err != nil {
 			return nil, fmt.Errorf("read list file %q: %w", value[1:], err)
+		}
+		content, readErr := io.ReadAll(io.LimitReader(file, security.MaxListFileBytes+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read list file %q: %w", value[1:], readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list file %q: %w", value[1:], closeErr)
+		}
+		if len(content) > security.MaxListFileBytes {
+			return nil, fmt.Errorf("list file %q exceeds the %d-byte limit", value[1:], security.MaxListFileBytes)
 		}
 		text, err := decodeListFile(content, charset)
 		if err != nil {
@@ -306,6 +325,9 @@ func expandListFiles(values []string, charset string) ([]string, error) {
 		for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
 			line = strings.TrimSuffix(line, "\r")
 			if line != "" {
+				if len(expanded) >= security.MaxArchiveEntries {
+					return nil, fmt.Errorf("list files contain more than %d path entries", security.MaxArchiveEntries)
+				}
 				expanded = append(expanded, line)
 			}
 		}

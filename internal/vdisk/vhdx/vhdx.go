@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/inpadi/7zip/internal/security"
 )
 
 const VHDX_MAGIC = "vhdxfile"
@@ -73,6 +74,7 @@ type VHDX struct {
 	bat             *BlockAllocationTable
 	sectorsPerBlock int
 	chunkRatio      int64
+	fileSize        int64
 }
 
 type FileAccessorFn func(string) (io.ReadSeeker, error)
@@ -82,7 +84,17 @@ var FileAccessor FileAccessorFn
 var ErrFileAccessorNotAvailable = errors.New("file accessor needed to access for parent and extents from file")
 
 func NewVHDX(fh io.ReadSeeker) (*VHDX, error) {
-	vhdx := &VHDX{fh: fh}
+	fileSize, err := fh.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	if fileSize < 5*ALIGNMENT {
+		return nil, errors.New("VHDX file is too small")
+	}
+	if _, err := fh.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	vhdx := &VHDX{fh: fh, fileSize: fileSize}
 
 	if err := binary.Read(fh, binary.LittleEndian, &vhdx.fileIdentifier); err != nil {
 		return nil, err
@@ -129,6 +141,9 @@ func NewVHDX(fh io.ReadSeeker) (*VHDX, error) {
 	if !ok {
 		return nil, errors.New("missing required region: metadata")
 	}
+	if err := vhdx.validateRegion(metadataEntry); err != nil {
+		return nil, fmt.Errorf("invalid metadata region: %w", err)
+	}
 	metadataTable, err := NewMetadataTable(fh, int64(metadataEntry.FileOffset), int64(metadataEntry.Length))
 	if err != nil {
 		return nil, err
@@ -168,7 +183,10 @@ func NewVHDX(fh io.ReadSeeker) (*VHDX, error) {
 		if FileAccessor == nil {
 			return nil, ErrFileAccessorNotAvailable
 		}
-		parentLocatorEntry := vhdx.metadata.lookup[PARENT_LOCATOR_GUID].(*ParentLocator)
+		parentLocatorEntry, ok := vhdx.metadata.lookup[PARENT_LOCATOR_GUID].(*ParentLocator)
+		if !ok || parentLocatorEntry == nil {
+			return nil, errors.New("missing VHDX parent locator")
+		}
 		if !bytes.Equal(parentLocatorEntry.typeID[:], VHDX_PARENT_LOCATOR_GUID[:]) {
 			return nil, fmt.Errorf("unknown parent locator type: %v", parentLocatorEntry.typeID)
 		}
@@ -184,12 +202,21 @@ func NewVHDX(fh io.ReadSeeker) (*VHDX, error) {
 	if !ok {
 		return nil, errors.New("missing required region: BAT")
 	}
-	vhdx.bat = NewBlockAllocationTable(vhdx, int64(batEntry.FileOffset))
+	if err := vhdx.validateRegion(batEntry); err != nil {
+		return nil, fmt.Errorf("invalid BAT region: %w", err)
+	}
+	vhdx.bat, err = NewBlockAllocationTable(vhdx, int64(batEntry.FileOffset), int64(batEntry.Length))
+	if err != nil {
+		return nil, err
+	}
 
 	return vhdx, nil
 }
 
 func (v *VHDX) ReadSectors(sector int64, count int64) ([]byte, error) {
+	if err := v.validateSectorRead(sector, count); err != nil {
+		return nil, err
+	}
 	var sectorsRead bytes.Buffer
 
 	for count > 0 {
@@ -215,8 +242,11 @@ func (v *VHDX) ReadSectors(sector int64, count int64) ([]byte, error) {
 		case PAYLOAD_BLOCK_UNDEFINED, PAYLOAD_BLOCK_ZERO, PAYLOAD_BLOCK_UNMAPPED:
 			sectorsRead.Write(bytes.Repeat([]byte{0x00}, int(readSize)))
 		case PAYLOAD_BLOCK_FULLY_PRESENT:
-			offset := int64((batEntry.FileOffsetMb * MB)) + sectorInBlock*int64(v.sectorSize)
-			_, err := v.fh.Seek(offset, io.SeekStart)
+			offset, err := v.dataOffset(batEntry.FileOffsetMb, sectorInBlock*int64(v.sectorSize), readSize)
+			if err != nil {
+				return nil, err
+			}
+			_, err = v.fh.Seek(offset, io.SeekStart)
 			if err != nil {
 				return nil, err
 			}
@@ -239,11 +269,15 @@ func (v *VHDX) ReadSectors(sector int64, count int64) ([]byte, error) {
 			sectorInChunk := (blockInChunk * int64(v.sectorsPerBlock)) + sectorInBlock
 			byteIdx, bitIdx := divmod(sectorInChunk, 8)
 
-			off := int64(sectorBitmapEntry.FileOffsetMb * MB)
-			if _, err := v.fh.Seek(off+int64(byteIdx), 0); err != nil {
+			bitmapSize := (bitIdx + readCount + 7) / 8
+			off, err := v.dataOffset(sectorBitmapEntry.FileOffsetMb, byteIdx, bitmapSize)
+			if err != nil {
 				return nil, err
 			}
-			sectorBitmap := make([]byte, (readCount+8-1)/8)
+			if _, err := v.fh.Seek(off, io.SeekStart); err != nil {
+				return nil, err
+			}
+			sectorBitmap := make([]byte, bitmapSize)
 			if _, err := io.ReadFull(v.fh, sectorBitmap); err != nil {
 				return nil, err
 			}
@@ -257,13 +291,17 @@ func (v *VHDX) ReadSectors(sector int64, count int64) ([]byte, error) {
 					}
 					sectorsRead.Write(parentData)
 				} else {
-					boff := batEntry.FileOffsetMb * MB
 					sec := (sectorInBlock + relativeSector) * int64(v.sectorSize)
-					_, err := v.fh.Seek(int64(boff)+int64(sec), io.SeekStart)
+					length := run.Count * int64(v.sectorSize)
+					boff, err := v.dataOffset(batEntry.FileOffsetMb, sec, length)
 					if err != nil {
 						return err
 					}
-					data := make([]byte, run.Count*int64(v.sectorSize))
+					_, err = v.fh.Seek(boff, io.SeekStart)
+					if err != nil {
+						return err
+					}
+					data := make([]byte, length)
 					_, err = io.ReadFull(v.fh, data)
 					if err != nil {
 						return err
@@ -285,6 +323,49 @@ func (v *VHDX) ReadSectors(sector int64, count int64) ([]byte, error) {
 	}
 
 	return sectorsRead.Bytes(), nil
+}
+
+func (v *VHDX) validateRegion(entry RegionTableEntry) error {
+	if entry.FileOffset > math.MaxInt64 {
+		return errors.New("region offset exceeds supported file size")
+	}
+	end := entry.FileOffset + uint64(entry.Length)
+	if end < entry.FileOffset || end > uint64(v.fileSize) {
+		return errors.New("region extends beyond the VHDX file")
+	}
+	return nil
+}
+
+func (v *VHDX) validateSectorRead(sector, count int64) error {
+	if sector < 0 || count < 0 {
+		return errors.New("negative VHDX sector range")
+	}
+	if count == 0 {
+		return nil
+	}
+	maxSectors := (int64(v.size) + int64(v.sectorSize) - 1) / int64(v.sectorSize)
+	if sector >= maxSectors || count > maxSectors-sector {
+		return errors.New("VHDX sector range exceeds virtual disk")
+	}
+	if count > int64(security.MaxDecoderMemory)/int64(v.sectorSize) {
+		return errors.New("VHDX sector read exceeds memory limit")
+	}
+	return nil
+}
+
+func (v *VHDX) dataOffset(fileOffsetMB uint64, relative, length int64) (int64, error) {
+	if relative < 0 || length < 0 || fileOffsetMB > math.MaxInt64/MB {
+		return 0, errors.New("invalid VHDX data extent")
+	}
+	base := int64(fileOffsetMB * MB)
+	if relative > math.MaxInt64-base || length > math.MaxInt64-base-relative {
+		return 0, errors.New("VHDX data extent overflows")
+	}
+	offset := base + relative
+	if offset+length > v.fileSize {
+		return 0, errors.New("VHDX data extent exceeds file size")
+	}
+	return offset, nil
 }
 
 func (v *VHDX) Size() uint64 {

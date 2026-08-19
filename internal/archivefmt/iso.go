@@ -14,6 +14,7 @@ import (
 
 	"github.com/carbon-os/diskiso/udf"
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 )
 
 const isoSectorSize = 2048
@@ -34,17 +35,13 @@ type isoArchive struct {
 }
 
 func openISO(name string) (*isoArchive, error) {
-	file, err := os.Open(name)
+	file, info, err := security.OpenRegularFile(name)
 	if err != nil {
 		return nil, err
 	}
 	closeError := func(err error) (*isoArchive, error) {
 		_ = file.Close()
 		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil {
-		return closeError(err)
 	}
 	if hasUDF, probeErr := udf.Probe(file); probeErr == nil && hasUDF {
 		volume, err := udf.NewVolume(file)
@@ -112,8 +109,8 @@ func (a *isoArchive) open(item isoEntry) (io.ReadCloser, error) {
 }
 
 func (a *isoArchive) walkUDF(volume *udf.Volume, directory, prefix string, imageSize int64, visited map[string]bool, depth int) error {
-	if depth > 128 {
-		return errors.New("UDF directory nesting exceeds 128 levels")
+	if depth > security.MaxNestingDepth {
+		return fmt.Errorf("UDF directory nesting exceeds %d levels", security.MaxNestingDepth)
 	}
 	if visited[directory] {
 		return fmt.Errorf("UDF directory cycle at %q", directory)
@@ -163,7 +160,7 @@ func (a *isoArchive) walkUDF(volume *udf.Volume, directory, prefix string, image
 			modified: info.ModTime(),
 		}
 		a.entries = append(a.entries, entry)
-		if len(a.entries) > 1_000_000 {
+		if len(a.entries) > security.MaxArchiveEntries {
 			return errors.New("UDF archive contains too many entries")
 		}
 		if mode.IsDir() {
@@ -176,8 +173,8 @@ func (a *isoArchive) walkUDF(volume *udf.Volume, directory, prefix string, image
 }
 
 func (a *isoArchive) walk(directory isoEntry, prefix string, unicodeNames bool, imageSize int64, visited map[[2]int64]bool, depth int) error {
-	if depth > 128 {
-		return errors.New("ISO directory nesting exceeds 128 levels")
+	if depth > security.MaxNestingDepth {
+		return fmt.Errorf("ISO directory nesting exceeds %d levels", security.MaxNestingDepth)
 	}
 	key := [2]int64{directory.offset, directory.size}
 	if visited[key] {
@@ -186,6 +183,9 @@ func (a *isoArchive) walk(directory isoEntry, prefix string, unicodeNames bool, 
 	visited[key] = true
 	if directory.offset < 0 || directory.size < 0 || directory.offset > imageSize-directory.size {
 		return errors.New("ISO directory extent is outside the image")
+	}
+	if directory.size > security.MaxMetadataBytes {
+		return fmt.Errorf("ISO directory extent exceeds the %d-byte metadata limit", security.MaxMetadataBytes)
 	}
 	data := make([]byte, directory.size)
 	if _, err := a.file.ReadAt(data, directory.offset); err != nil {
@@ -215,6 +215,9 @@ func (a *isoArchive) walk(directory isoEntry, prefix string, unicodeNames bool, 
 			record.name = strings.TrimSuffix(record.name, "/") + "/"
 		}
 		a.entries = append(a.entries, record)
+		if len(a.entries) > security.MaxArchiveEntries {
+			return errors.New("ISO archive contains too many entries")
+		}
 		if record.mode.IsDir() {
 			if err := a.walk(record, strings.TrimSuffix(record.name, "/"), unicodeNames, imageSize, visited, depth+1); err != nil {
 				return err
@@ -318,12 +321,16 @@ func listISO(archive string, patterns []string) ([]Entry, error) {
 	}
 	defer iso.Close()
 	var entries []Entry
+	var budget security.Budget
 	for _, item := range iso.entries {
 		selected, err := archive7z.Matches(item.name, patterns)
 		if err != nil {
 			return nil, err
 		}
 		if selected {
+			if err := budget.AddEntry(item.name, uint64(item.size)); err != nil {
+				return nil, err
+			}
 			entries = append(entries, Entry{Name: item.name, Size: uint64(item.size), Modified: item.modified, Mode: item.mode})
 		}
 	}
@@ -336,15 +343,17 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 		return Result{}, err
 	}
 	defer iso.Close()
-	root := ""
+	var root *security.Root
 	seen := make(map[string]string)
 	if extract != nil {
 		root, err = extractionRoot(extract.OutputDir)
 		if err != nil {
 			return Result{}, err
 		}
+		defer root.Close()
 	}
 	var result Result
+	var budget security.Budget
 	for _, item := range iso.entries {
 		selected, matchErr := archive7z.Matches(item.name, patterns)
 		if matchErr != nil {
@@ -365,7 +374,7 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 			stream = reader
 		}
 		if extract != nil {
-			n, wrote, extractErr := extractEntry(root, item.name, item.mode, item.modified, stream, *extract, seen)
+			n, wrote, extractErr := extractEntry(root, item.name, item.mode, uint64(item.size), stream, *extract, seen, &budget)
 			if reader != nil {
 				closeErr := reader.Close()
 				if extractErr == nil {
@@ -385,9 +394,15 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 			continue
 		}
 		if item.mode.IsDir() {
+			if err := budget.AddEntry(item.name, 0); err != nil {
+				return result, err
+			}
 			continue
 		}
-		n, copyErr := io.Copy(dst, stream)
+		if err := budget.AddEntry(item.name, uint64(item.size)); err != nil {
+			return result, err
+		}
+		n, copyErr := budget.Copy(dst, stream, item.name)
 		closeErr := reader.Close()
 		if copyErr != nil {
 			return result, copyErr

@@ -12,34 +12,66 @@ import (
 	"strings"
 
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 )
 
 type sourceFile struct {
-	path string
-	name string
-	info fs.FileInfo
+	path     string
+	name     string
+	info     fs.FileInfo
+	root     *security.Root
+	relative string
 }
 
-func collectSources(sources []string, archive string, recursive bool) ([]sourceFile, error) {
-	archiveAbs, err := filepath.Abs(archive)
+func (s sourceFile) open() (*os.File, error) {
+	before, err := s.root.Lstat(s.relative)
 	if err != nil {
 		return nil, err
 	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || !os.SameFile(s.info, before) {
+		return nil, fmt.Errorf("input %q changed after it was enumerated", s.path)
+	}
+	file, err := s.root.Open(s.relative)
+	if err != nil {
+		return nil, err
+	}
+	after, err := file.Stat()
+	if err != nil || !os.SameFile(before, after) {
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("input %q changed while it was opened", s.path)
+	}
+	return file, nil
+}
+
+func collectSources(sources []string, archive string, recursive bool) ([]sourceFile, []*security.Root, error) {
+	archiveAbs, err := filepath.Abs(archive)
+	if err != nil {
+		return nil, nil, err
+	}
 	files := make(map[string]sourceFile)
+	rootCache := make(map[string]*security.Root)
+	var roots []*security.Root
+	closeError := func(err error) ([]sourceFile, []*security.Root, error) {
+		closeSourceRoots(roots)
+		return nil, nil, err
+	}
 	for _, source := range sources {
 		matches := []string{source}
 		if strings.ContainsAny(source, "*?") {
 			matches, err = sourceMatches(source, recursive)
 			if err != nil {
-				return nil, fmt.Errorf("invalid input wildcard %q: %w", source, err)
+				return closeError(fmt.Errorf("invalid input wildcard %q: %w", source, err))
 			}
 			if len(matches) == 0 {
-				return nil, fmt.Errorf("no input files match %q", source)
+				return closeError(fmt.Errorf("no input files match %q", source))
 			}
 		}
 		for _, match := range matches {
-			if err := collectSource(match, archiveAbs, files); err != nil {
-				return nil, err
+			if err := collectSource(match, archiveAbs, files, rootCache, &roots); err != nil {
+				return closeError(err)
 			}
 		}
 	}
@@ -48,7 +80,13 @@ func collectSources(sources []string, archive string, recursive bool) ([]sourceF
 		result = append(result, file)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].name < result[j].name })
-	return result, nil
+	return result, roots, nil
+}
+
+func closeSourceRoots(roots []*security.Root) {
+	for _, root := range roots {
+		_ = root.Close()
+	}
 }
 
 func sourceMatches(pattern string, recursive bool) ([]string, error) {
@@ -78,6 +116,9 @@ func sourceMatches(pattern string, recursive bool) ([]string, error) {
 			return err
 		}
 		if sourceWildcardPathMatch(filepath.ToSlash(relPattern), filepath.ToSlash(rel), recursive) {
+			if len(matches) >= security.MaxArchiveEntries {
+				return fmt.Errorf("input wildcard matches more than %d paths", security.MaxArchiveEntries)
+			}
 			matches = append(matches, name)
 		}
 		return nil
@@ -137,7 +178,7 @@ func equalSourceRune(a, b rune) bool {
 	return a == b
 }
 
-func collectSource(source, archiveAbs string, files map[string]sourceFile) error {
+func collectSource(source, archiveAbs string, files map[string]sourceFile, rootCache map[string]*security.Root, roots *[]*security.Root) error {
 	abs, err := filepath.Abs(source)
 	if err != nil {
 		return err
@@ -151,9 +192,31 @@ func collectSource(source, archiveAbs string, files map[string]sourceFile) error
 	}
 	base := sourceBaseName(source, abs)
 	if !info.IsDir() {
-		return addSource(abs, base, info, archiveAbs, files)
+		root, err := cachedSourceRoot(filepath.Dir(abs), rootCache, roots)
+		if err != nil {
+			return fmt.Errorf("open input parent %q: %w", filepath.Dir(abs), err)
+		}
+		anchored, err := root.Lstat(filepath.Base(abs))
+		if err != nil || !os.SameFile(info, anchored) {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("input %q changed while it was opened", source)
+		}
+		return addSource(abs, base, anchored, archiveAbs, files, root, filepath.Base(abs))
 	}
-	return filepath.WalkDir(abs, func(name string, entry fs.DirEntry, walkErr error) error {
+	root, err := cachedSourceRoot(abs, rootCache, roots)
+	if err != nil {
+		return fmt.Errorf("open input directory %q: %w", source, err)
+	}
+	anchored, err := root.Lstat(".")
+	if err != nil || !os.SameFile(info, anchored) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("input directory %q changed while it was opened", source)
+	}
+	return fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -164,22 +227,39 @@ func collectSource(source, archiveAbs string, files map[string]sourceFile) error
 		if entryInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symbolic-link input %q is not supported", name)
 		}
-		rel, err := filepath.Rel(abs, name)
-		if err != nil {
-			return err
-		}
 		archiveName := base
-		if rel != "." {
-			archiveName = path.Join(base, filepath.ToSlash(rel))
+		if name != "." {
+			archiveName = path.Join(base, name)
 		}
 		if archiveName == "." {
 			return nil
 		}
-		return addSource(name, archiveName, entryInfo, archiveAbs, files)
+		display := abs
+		if name != "." {
+			display = filepath.Join(abs, filepath.FromSlash(name))
+		}
+		return addSource(display, archiveName, entryInfo, archiveAbs, files, root, name)
 	})
 }
 
-func addSource(name, archiveName string, info fs.FileInfo, archiveAbs string, files map[string]sourceFile) error {
+func cachedSourceRoot(name string, cache map[string]*security.Root, roots *[]*security.Root) (*security.Root, error) {
+	key := filepath.Clean(name)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	if root := cache[key]; root != nil {
+		return root, nil
+	}
+	root, err := security.OpenExistingRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	cache[key] = root
+	*roots = append(*roots, root)
+	return root, nil
+}
+
+func addSource(name, archiveName string, info fs.FileInfo, archiveAbs string, files map[string]sourceFile, root *security.Root, relative string) error {
 	if !info.Mode().IsRegular() && !info.IsDir() {
 		return fmt.Errorf("special input %q (%s) is not supported", name, info.Mode().Type())
 	}
@@ -195,10 +275,14 @@ func addSource(name, archiveName string, info fs.FileInfo, archiveAbs string, fi
 		return err
 	}
 	key := nameKey(clean)
-	if previous, exists := files[key]; exists && !sameFilePath(previous.path, abs) {
+	previous, exists := files[key]
+	if exists && !sameFilePath(previous.path, abs) {
 		return fmt.Errorf("inputs %q and %q have the same archive name %q", previous.path, abs, clean)
 	}
-	files[key] = sourceFile{path: abs, name: clean, info: info}
+	if !exists && len(files) >= security.MaxArchiveEntries {
+		return fmt.Errorf("input contains more than %d entries", security.MaxArchiveEntries)
+	}
+	files[key] = sourceFile{path: abs, name: clean, info: info, root: root, relative: relative}
 	return nil
 }
 

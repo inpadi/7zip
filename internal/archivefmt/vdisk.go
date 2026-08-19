@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/vdisk/vhd"
 	"github.com/inpadi/7zip/internal/vdisk/vhdx"
 )
@@ -37,13 +38,8 @@ type diskArchive struct {
 }
 
 func openVirtualDisk(name string, format Format) (*diskArchive, error) {
-	file, err := os.Open(name)
+	file, info, err := security.OpenRegularFile(name)
 	if err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
 		return nil, err
 	}
 	var disk virtualDisk
@@ -94,6 +90,10 @@ func listVirtualDisk(archive string, patterns []string, format Format) ([]Entry,
 	if err != nil || !selected {
 		return nil, err
 	}
+	var budget security.Budget
+	if err := budget.AddEntry(entry.Name, entry.Size); err != nil {
+		return nil, err
+	}
 	return []Entry{entry}, nil
 }
 
@@ -108,9 +108,13 @@ func processVirtualDisk(archive string, patterns []string, format Format, dst io
 	if err != nil || !selected {
 		return Result{}, err
 	}
+	var budget security.Budget
 	reader := io.NewSectionReader(input.disk, 0, int64(entry.Size))
 	if extract == nil {
-		n, err := io.Copy(dst, reader)
+		if err := budget.AddEntry(entry.Name, entry.Size); err != nil {
+			return Result{}, err
+		}
+		n, err := budget.Copy(dst, reader, entry.Name)
 		if err != nil {
 			return Result{}, err
 		}
@@ -120,7 +124,8 @@ func processVirtualDisk(archive string, patterns []string, format Format, dst io
 	if err != nil {
 		return Result{}, err
 	}
-	n, wrote, err := extractEntry(root, entry.Name, entry.Mode, entry.Modified, reader, *extract, make(map[string]string))
+	defer root.Close()
+	n, wrote, err := extractEntry(root, entry.Name, entry.Mode, entry.Size, reader, *extract, make(map[string]string), &budget)
 	if err != nil {
 		return Result{}, err
 	}

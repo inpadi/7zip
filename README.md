@@ -6,31 +6,16 @@ The migration is incremental. `C/`, `CPP/`, and `Asm/` remain as the pinned upst
 
 ## Download prebuilt binaries
 
-| Operating system | Architecture | Download |
-| --- | --- | --- |
-| Windows | x64 | [Download `i7z.exe`](Out/windows/amd64/i7z.exe?raw=1) |
-| Windows | ARM64 | [Download `i7z.exe`](Out/windows/arm64/i7z.exe?raw=1) |
-| Windows | x86 (32-bit) | [Download `i7z.exe`](Out/windows/386/i7z.exe?raw=1) |
-| Linux | x64 | [Download `i7z`](Out/linux/amd64/i7z?raw=1) |
-| Linux | ARM64 | [Download `i7z`](Out/linux/arm64/i7z?raw=1) |
-| Linux | ARM (32-bit) | [Download `i7z`](Out/linux/arm/i7z?raw=1) |
-| Linux | x86 (32-bit) | [Download `i7z`](Out/linux/386/i7z?raw=1) |
-| macOS | Apple silicon (ARM64) | [Download `i7z`](Out/darwin/arm64/i7z?raw=1) |
-| macOS | Intel x64 | [Download `i7z`](Out/darwin/amd64/i7z?raw=1) |
+Prebuilt binaries are published only as tagged [GitHub Releases](../../releases). Each release includes a SHA-256 manifest, a per-target CycloneDX SBOM, and a GitHub build-provenance attestation. Binaries are not stored in the source tree.
 
-The Windows binaries are Authenticode-signed by `inpadi ApS`. Verify the signature after downloading:
-
-```powershell
-Get-AuthenticodeSignature .\i7z.exe | Format-List Status, SignerCertificate
-```
-
-A valid Windows binary reports `Status: Valid`. Linux and macOS users may need to make the downloaded file executable:
+Verify a downloaded artifact before running it:
 
 ```sh
-chmod +x i7z
+sha256sum --check SHA256SUMS --ignore-missing
+gh attestation verify ./i7z-linux-amd64 --repo inpadi/7zip
 ```
 
-The binaries are built with `CGO_ENABLED=0`. See [RELEASE.md](RELEASE.md) for the complete release and verification policy.
+Release binaries are built with `CGO_ENABLED=0` from the tagged revision. See [RELEASE.md](RELEASE.md) for the complete release and verification policy.
 
 ## Implemented
 

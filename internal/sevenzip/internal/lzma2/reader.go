@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/ulikunitz/xz/lzma"
 )
 
@@ -62,9 +63,11 @@ func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 		return nil, errInvalidProperties
 	}
 
-	config := lzma.Reader2Config{
-		DictCap: (2 | (int(p[0]) & 1)) << (p[0]/2 + 11), // This gem came from Lzma2Dec.c
+	dictionary := uint64(2|p[0]&1) << (p[0]/2 + 11)
+	if dictionary > security.MaxDecoderMemory {
+		return nil, fmt.Errorf("lzma2: dictionary exceeds the %d-byte memory limit", security.MaxDecoderMemory)
 	}
+	config := lzma.Reader2Config{DictCap: int(dictionary)}
 
 	if err := config.Verify(); err != nil {
 		return nil, fmt.Errorf("lzma2: error verifying config: %w", err)

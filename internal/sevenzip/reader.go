@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"io"
 	iofs "io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -18,9 +19,9 @@ import (
 	"time"
 
 	"github.com/bodgit/plumbing"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/sevenzip/internal/pool"
 	"github.com/inpadi/7zip/internal/sevenzip/internal/util"
-	"github.com/spf13/afero"
 	"go4.org/readerutil"
 )
 
@@ -63,7 +64,7 @@ type Reader struct {
 
 // A ReadCloser is a [Reader] that must be closed when no longer needed.
 type ReadCloser struct {
-	f []afero.File
+	f []*os.File
 	Reader
 }
 
@@ -213,29 +214,57 @@ func (f *File) Open() (io.ReadCloser, error) {
 	}, nil
 }
 
-func openReader(fs afero.Fs, name string) (io.ReaderAt, int64, []afero.File, error) {
-	f, err := fs.Open(filepath.Clean(name))
+func openVolume(root *security.Root, name string) (*os.File, int64, error) {
+	before, err := root.Lstat(name)
+	if err != nil {
+		return nil, 0, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, 0, fmt.Errorf("sevenzip: refusing non-regular archive volume %q", name)
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, 0, err
+	}
+	after, err := file.Stat()
+	if err != nil || !os.SameFile(before, after) {
+		file.Close()
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, 0, fmt.Errorf("sevenzip: archive volume %q changed while opening it", name)
+	}
+	if after.Size() < 0 || after.Size() > security.MaxArchiveBytes {
+		file.Close()
+		return nil, 0, fmt.Errorf("sevenzip: archive volume %q exceeds the size limit", name)
+	}
+	return file, after.Size(), nil
+}
+
+func openReader(name string) (io.ReaderAt, int64, []*os.File, error) {
+	abs, err := filepath.Abs(filepath.Clean(name))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	root, err := security.OpenExistingRoot(filepath.Dir(abs))
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("sevenzip: error opening archive directory: %w", err)
+	}
+	defer root.Close()
+	base := filepath.Base(abs)
+	f, size, err := openVolume(root, base)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("sevenzip: error opening: %w", err)
 	}
-
-	info, err := f.Stat()
-	if err != nil {
-		err = errors.Join(err, f.Close())
-
-		return nil, 0, nil, fmt.Errorf("sevenzip: error retrieving file info: %w", err)
-	}
-
 	var reader io.ReaderAt = f
+	files := []*os.File{f}
 
-	size := info.Size()
-	files := []afero.File{f}
-
-	if ext := filepath.Ext(name); ext == ".001" {
+	if ext := filepath.Ext(base); ext == ".001" {
 		sr := []readerutil.SizeReaderAt{io.NewSectionReader(f, 0, size)}
 
-		for i := 2; true; i++ {
-			f, err := fs.Open(fmt.Sprintf("%s.%03d", strings.TrimSuffix(name, ext), i))
+		for i := 2; i <= security.MaxArchiveVolumes; i++ {
+			volumeName := fmt.Sprintf("%s.%03d", strings.TrimSuffix(base, ext), i)
+			f, volumeSize, err := openVolume(root, volumeName)
 			if err != nil {
 				if errors.Is(err, iofs.ErrNotExist) {
 					break
@@ -252,24 +281,23 @@ func openReader(fs afero.Fs, name string) (io.ReaderAt, int64, []afero.File, err
 			}
 
 			files = append(files, f)
-
-			info, err = f.Stat()
-			if err != nil {
-				errs := make([]error, 0, len(files)+1)
-				errs = append(errs, err)
-
-				for _, file := range files {
-					errs = append(errs, file.Close())
-				}
-
-				return nil, 0, nil, fmt.Errorf("sevenzip: error retrieving file info: %w", errors.Join(errs...))
+			sr = append(sr, io.NewSectionReader(f, 0, volumeSize))
+		}
+		if len(files) == security.MaxArchiveVolumes {
+			for _, file := range files {
+				_ = file.Close()
 			}
-
-			sr = append(sr, io.NewSectionReader(f, 0, info.Size()))
+			return nil, 0, nil, fmt.Errorf("sevenzip: archive exceeds the %d-volume limit", security.MaxArchiveVolumes)
 		}
 
 		mr := readerutil.NewMultiReaderAt(sr...)
 		reader, size = mr, mr.Size()
+		if size > security.MaxArchiveBytes {
+			for _, file := range files {
+				_ = file.Close()
+			}
+			return nil, 0, nil, fmt.Errorf("sevenzip: archive exceeds the %d-byte size limit", security.MaxArchiveBytes)
+		}
 	}
 
 	return reader, size, files, nil
@@ -280,7 +308,7 @@ func openReader(fs afero.Fs, name string) (io.ReaderAt, int64, []afero.File, err
 // name has a ".001" suffix it is assumed there are multiple volumes and each
 // sequential volume will be opened.
 func OpenReaderWithPassword(name, password string) (*ReadCloser, error) {
-	reader, size, files, err := openReader(afero.NewOsFs(), name)
+	reader, size, files, err := openReader(name)
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +596,11 @@ func (z *Reader) init(r io.ReaderAt, size int64) (err error) {
 			}
 
 			if !fh.isEmptyStream && !fh.isEmptyFile {
-				f.folder, _, _ = header.streamsInfo.FileFolderAndSize(j)
+				var streamErr error
+				f.folder, _, _, streamErr = header.streamsInfo.FileFolderAndSize(j)
+				if streamErr != nil {
+					return streamErr
+				}
 
 				// Make an exported copy of the folder index
 				f.Stream = f.folder
@@ -616,6 +648,22 @@ func (rc *ReadCloser) Volumes() []string {
 	}
 
 	return volumes
+}
+
+// CompressedSize returns the total size of all opened archive volumes.
+func (rc *ReadCloser) CompressedSize() (int64, error) {
+	var total int64
+	for _, file := range rc.f {
+		info, err := file.Stat()
+		if err != nil {
+			return 0, err
+		}
+		if info.Size() < 0 || total > security.MaxArchiveBytes-info.Size() {
+			return 0, errors.New("sevenzip: archive size exceeds limit")
+		}
+		total += info.Size()
+	}
+	return total, nil
 }
 
 // Close closes the 7-zip file or volumes, rendering them unusable for I/O.

@@ -7,23 +7,24 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	dsnetbzip2 "github.com/dsnet/compress/bzip2"
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
 
 type tarInput struct {
-	file   *os.File
-	reader *tar.Reader
-	close  func() error
+	file       *os.File
+	reader     *tar.Reader
+	close      func() error
+	compressed int64
 }
 
 func openTar(archive string, format Format) (*tarInput, error) {
-	file, err := os.Open(archive)
+	file, info, err := security.OpenRegularFile(archive)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +50,12 @@ func openTar(archive string, format Format) (*tarInput, error) {
 		reader = compressed
 		closeCompression = compressed.Close
 	case FormatTarZstd:
-		compressed, zstdErr := zstd.NewReader(file)
+		compressed, zstdErr := zstd.NewReader(file,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(security.MaxDecoderMemory),
+			zstd.WithDecoderMaxWindow(security.MaxDecoderMemory),
+			zstd.WithDecoderLowmem(true),
+		)
 		if zstdErr != nil {
 			_ = file.Close()
 			return nil, zstdErr
@@ -61,8 +67,9 @@ func openTar(archive string, format Format) (*tarInput, error) {
 		}
 	}
 	return &tarInput{
-		file:   file,
-		reader: tar.NewReader(reader),
+		file:       file,
+		reader:     tar.NewReader(reader),
+		compressed: info.Size(),
 		close: func() error {
 			compressionErr := closeCompression()
 			fileErr := file.Close()
@@ -139,14 +146,11 @@ func newTarOutput(dst io.Writer, format Format, level int) (*tarOutput, error) {
 }
 
 func addTar(archive string, sourceNames []string, format Format, level int, recursive bool, excludes []string) (result Result, err error) {
-	existed, err := archiveExists(archive)
+	sources, roots, err := collectSources(sourceNames, archive, recursive)
 	if err != nil {
 		return result, err
 	}
-	sources, err := collectSources(sourceNames, archive, recursive)
-	if err != nil {
-		return result, err
-	}
+	defer closeSourceRoots(roots)
 	sources, err = filterSources(sources, excludes, recursive)
 	if err != nil {
 		return result, err
@@ -158,6 +162,12 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 	for _, source := range sources {
 		replacements[nameKey(source.name)] = struct{}{}
 	}
+	output, err := security.CreateOutput(archive)
+	if err != nil {
+		return result, err
+	}
+	defer output.Cleanup()
+	existed := output.Existed()
 
 	var old *tarInput
 	if existed {
@@ -171,28 +181,12 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 			}
 		}()
 	}
-	absolute, err := filepath.Abs(archive)
-	if err != nil {
-		return result, err
-	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
-		return result, err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(absolute), ".tar-go-*.tmp")
-	if err != nil {
-		return result, err
-	}
-	tempName := temp.Name()
-	defer func() {
-		_ = temp.Close()
-		if err != nil {
-			_ = os.Remove(tempName)
-		}
-	}()
+	temp := output.File()
 	out, err := newTarOutput(temp, format, level)
 	if err != nil {
 		return result, err
 	}
+	var budget security.Budget
 
 	if old != nil {
 		for {
@@ -210,6 +204,9 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 			if _, replaced := replacements[nameKey(name)]; replaced {
 				continue
 			}
+			if err := budget.AddEntry(name, uint64(max(header.Size, 0))); err != nil {
+				return result, err
+			}
 			copyHeader := *header
 			copyHeader.Name = name
 			if header.FileInfo().IsDir() {
@@ -219,14 +216,19 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 				return result, writeErr
 			}
 			if header.Size > 0 {
-				if _, copyErr := io.CopyN(out.writer, old.reader, header.Size); copyErr != nil {
+				if n, copyErr := budget.Copy(out.writer, old.reader, name); copyErr != nil {
 					return result, copyErr
+				} else if n != header.Size {
+					return result, fmt.Errorf("preserve %q: expected %d bytes, read %d", name, header.Size, n)
 				}
 			}
 		}
 	}
 
 	for _, source := range sources {
+		if err := budget.AddEntry(source.name, uint64(max(source.info.Size(), 0))); err != nil {
+			return result, err
+		}
 		header, headerErr := tar.FileInfoHeader(source.info, "")
 		if headerErr != nil {
 			return result, headerErr
@@ -241,11 +243,11 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 		if source.info.IsDir() {
 			continue
 		}
-		src, openErr := os.Open(source.path)
+		src, openErr := source.open()
 		if openErr != nil {
 			return result, openErr
 		}
-		n, copyErr := io.Copy(out.writer, src)
+		n, copyErr := budget.Copy(out.writer, src, source.name)
 		closeErr := src.Close()
 		if copyErr != nil {
 			return result, copyErr
@@ -262,7 +264,7 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 	if err = temp.Sync(); err != nil {
 		return result, err
 	}
-	if err = temp.Close(); err != nil {
+	if err = output.CloseFile(); err != nil {
 		return result, err
 	}
 	if old != nil {
@@ -271,7 +273,7 @@ func addTar(archive string, sourceNames []string, format Format, level int, recu
 		}
 		old = nil
 	}
-	if err = publish(tempName, absolute, existed); err != nil {
+	if err = output.Publish(); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -284,6 +286,8 @@ func listTar(archive string, patterns []string, format Format) ([]Entry, error) 
 	}
 	defer input.close()
 	var entries []Entry
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
 	for {
 		header, nextErr := input.reader.Next()
 		if nextErr == io.EOF {
@@ -298,6 +302,9 @@ func listTar(archive string, patterns []string, format Format) ([]Entry, error) 
 		}
 		if !selected {
 			continue
+		}
+		if err := budget.AddEntry(header.Name, uint64(max(header.Size, 0))); err != nil {
+			return nil, err
 		}
 		entries = append(entries, Entry{
 			Name:     header.Name,
@@ -316,6 +323,8 @@ func testTar(archive string, patterns []string, format Format) (Result, error) {
 	}
 	defer input.close()
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
 	for {
 		header, nextErr := input.reader.Next()
 		if nextErr == io.EOF {
@@ -328,10 +337,19 @@ func testTar(archive string, patterns []string, format Format) (Result, error) {
 		if matchErr != nil {
 			return result, matchErr
 		}
-		if !selected || header.FileInfo().IsDir() {
+		if !selected {
 			continue
 		}
-		n, copyErr := io.Copy(io.Discard, input.reader)
+		if err := budget.AddEntry(header.Name, uint64(max(header.Size, 0))); err != nil {
+			return result, err
+		}
+		if header.FileInfo().IsDir() {
+			continue
+		}
+		if header.FileInfo().Mode().Type() != 0 {
+			return result, fmt.Errorf("refusing unsupported special entry %q", header.Name)
+		}
+		n, copyErr := budget.Copy(io.Discard, input.reader, header.Name)
 		if copyErr != nil {
 			return result, copyErr
 		}
@@ -348,6 +366,8 @@ func writeTar(archive string, patterns []string, format Format, dst io.Writer) (
 	}
 	defer input.close()
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
 	for {
 		header, nextErr := input.reader.Next()
 		if nextErr == io.EOF {
@@ -360,13 +380,19 @@ func writeTar(archive string, patterns []string, format Format, dst io.Writer) (
 		if matchErr != nil {
 			return result, matchErr
 		}
-		if !selected || header.FileInfo().IsDir() {
+		if !selected {
+			continue
+		}
+		if err := budget.AddEntry(header.Name, uint64(max(header.Size, 0))); err != nil {
+			return result, err
+		}
+		if header.FileInfo().IsDir() {
 			continue
 		}
 		if header.FileInfo().Mode().Type() != 0 {
 			return result, fmt.Errorf("refusing unsupported special entry %q", header.Name)
 		}
-		n, copyErr := io.Copy(dst, input.reader)
+		n, copyErr := budget.Copy(dst, input.reader, header.Name)
 		if copyErr != nil {
 			return result, copyErr
 		}
@@ -381,6 +407,7 @@ func extractTar(archive string, options ExtractOptions, format Format) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
+	defer root.Close()
 	input, err := openTar(archive, format)
 	if err != nil {
 		return Result{}, err
@@ -388,6 +415,8 @@ func extractTar(archive string, options ExtractOptions, format Format) (Result, 
 	defer input.close()
 	seen := make(map[string]string)
 	var result Result
+	var budget security.Budget
+	budget.SetCompressedBytes(input.compressed)
 	for {
 		header, nextErr := input.reader.Next()
 		if nextErr == io.EOF {
@@ -407,10 +436,11 @@ func extractTar(archive string, options ExtractOptions, format Format) (Result, 
 			root,
 			header.Name,
 			header.FileInfo().Mode(),
-			header.ModTime,
+			uint64(max(header.Size, 0)),
 			input.reader,
 			options,
 			seen,
+			&budget,
 		)
 		if extractErr != nil {
 			return result, fmt.Errorf("extract %q: %w", header.Name, extractErr)

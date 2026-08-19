@@ -12,6 +12,7 @@ import (
 
 	"github.com/inpadi/7zip/internal/archivefmt"
 	"github.com/inpadi/7zip/internal/cli"
+	"github.com/inpadi/7zip/internal/security"
 )
 
 const (
@@ -127,6 +128,12 @@ func materializeStdin(opts cli.Options, stdin io.Reader) (cli.Options, func(), e
 		return opts, func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(root) }
+	rootHandle, err := security.OpenExistingRoot(root)
+	if err != nil {
+		cleanup()
+		return opts, func() {}, err
+	}
+	defer rootHandle.Close()
 	name := archiveSuffix(opts.Archive, opts.Format)
 	if opts.Command == cli.CommandAdd || opts.Command == cli.CommandUpdate {
 		name = opts.StdinName
@@ -142,12 +149,20 @@ func materializeStdin(opts cli.Options, stdin io.Reader) (cli.Options, func(), e
 		name = "archive" + name
 	}
 	target := filepath.Join(root, name)
-	file, err := os.Create(target)
+	file, err := rootHandle.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		cleanup()
 		return opts, func() {}, err
 	}
-	_, copyErr := io.Copy(file, stdin)
+	limit := security.MaxArchiveBytes
+	if opts.Command == cli.CommandAdd || opts.Command == cli.CommandUpdate {
+		limit = security.MaxFileBytes
+	}
+	limited := &io.LimitedReader{R: stdin, N: limit + 1}
+	n, copyErr := io.Copy(file, limited)
+	if copyErr == nil && n > limit {
+		copyErr = fmt.Errorf("stdin exceeds the %d-byte input limit", limit)
+	}
 	closeErr := file.Close()
 	if copyErr != nil {
 		cleanup()
@@ -175,7 +190,7 @@ func runAddToWriter(opts cli.Options, stdout, stderr io.Writer) int {
 	if _, err := archivefmt.Add(archive, addFiles(opts), addOptions(opts)); err != nil {
 		return operationError(stderr, err)
 	}
-	file, err := os.Open(archive)
+	file, _, err := security.OpenRegularFile(archive)
 	if err != nil {
 		return operationError(stderr, err)
 	}

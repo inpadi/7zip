@@ -86,3 +86,33 @@ func TestAddRecursiveExcludes(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceOpenRejectsReplacementAfterEnumeration(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "input.txt")
+	secret := filepath.Join(root, "secret.txt")
+	if err := os.WriteFile(input, []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sources, roots, err := collectSources([]string{input}, filepath.Join(root, "archive.zip"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeSourceRoots(roots)
+	if err := os.Remove(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(secret, input); err != nil {
+		t.Fatal(err)
+	}
+	file, err := sources[0].open()
+	if file != nil {
+		file.Close()
+	}
+	if err == nil {
+		t.Fatal("expected replaced source to be rejected")
+	}
+}

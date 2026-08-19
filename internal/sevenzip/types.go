@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/bits"
 	"time"
 
 	"github.com/bodgit/windows"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/sevenzip/internal/util"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
@@ -61,11 +61,7 @@ func checkUint64(v uint64, nonZero bool) error {
 		return errUint64NonZero
 	}
 
-	// Ensure the value does not exceed math.MaxInt to prevent implicit
-	// conversion panics when passed to make() on 32-bit architectures,
-	// and limit it to math.MaxUint32 to prevent slice allocation panics
-	// on 64-bit architectures.
-	if v > uint64(math.MaxInt) || v > math.MaxUint32 {
+	if v > security.MaxMetadataItems {
 		return errUint64TooLarge
 	}
 
@@ -296,6 +292,9 @@ func readCoder(r util.Reader) (*coder, error) {
 		if err != nil {
 			return nil, err
 		}
+		if size > security.MaxMetadataBytes {
+			return nil, errors.New("sevenzip: coder properties exceed metadata limit")
+		}
 
 		c.properties = make([]byte, size)
 		if n, err := r.Read(c.properties); err != nil || uint64(n) != size { //nolint:gosec
@@ -317,6 +316,9 @@ func readFolder(r util.Reader) (*folder, error) {
 	coders, err := readUint64Bounded(r, true)
 	if err != nil {
 		return nil, err
+	}
+	if coders > 64 {
+		return nil, errors.New("sevenzip: folder contains too many coders")
 	}
 
 	f.coder = make([]*coder, 0, min(coders, 16))
@@ -364,6 +366,9 @@ func readFolder(r util.Reader) (*folder, error) {
 			in:  in,
 			out: out,
 		})
+		if in >= f.in || out >= f.out {
+			return nil, errInvalidBindPair
+		}
 	}
 
 	f.packedStreams = f.in - bindPairs
@@ -380,6 +385,9 @@ func readFolder(r util.Reader) (*folder, error) {
 		for i := range f.packedStreams {
 			if f.packed[i], err = readUint64(r); err != nil {
 				return nil, err
+			}
+			if f.packed[i] >= f.in || f.findInBindPair(f.packed[i]) != nil {
+				return nil, errInvalidBindPair
 			}
 		}
 	}
@@ -402,6 +410,9 @@ func readUnpackInfo(r util.Reader) (*unpackInfo, error) {
 	folders, err := readUint64Bounded(r, true)
 	if err != nil {
 		return nil, err
+	}
+	if folders > security.MaxArchiveEntries {
+		return nil, errors.New("sevenzip: too many folders")
 	}
 
 	external, err := r.ReadByte()
@@ -498,6 +509,9 @@ func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error
 			if s.streams[i], err = readUint64(r); err != nil {
 				return nil, err
 			}
+			if s.streams[i] > security.MaxArchiveEntries {
+				return nil, errors.New("sevenzip: too many substreams")
+			}
 		}
 
 		id, err = r.ReadByte()
@@ -513,6 +527,9 @@ func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error
 	// Count the files in each stream
 	files := uint64(0)
 	for _, v := range s.streams {
+		if files > security.MaxArchiveEntries-v {
+			return nil, errors.New("sevenzip: too many substreams")
+		}
 		files += v
 	}
 
@@ -536,10 +553,16 @@ func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error
 					return nil, err
 				}
 
+				if total > folder[i].unpackSize()-min(folder[i].unpackSize(), s.size[k]) {
+					return nil, errors.New("sevenzip: substream sizes exceed folder size")
+				}
 				total += s.size[k]
 				k++
 			}
 
+			if total > folder[i].unpackSize() {
+				return nil, errors.New("sevenzip: substream sizes exceed folder size")
+			}
 			s.size[k] = folder[i].unpackSize() - total
 			k++
 		}
@@ -564,7 +587,6 @@ func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error
 	if id != idEnd {
 		return nil, errUnexpectedID
 	}
-
 	return s, nil
 }
 
@@ -616,6 +638,9 @@ func readStreamsInfo(r util.Reader) (*streamsInfo, error) {
 
 	if id != idEnd {
 		return nil, errUnexpectedID
+	}
+	if err := s.validate(); err != nil {
+		return nil, err
 	}
 
 	return s, nil
@@ -685,6 +710,9 @@ func splitNull(data []byte, atEOF bool) (advance int, token []byte, err error) {
 func readNames(r util.Reader, count, length uint64) ([]string, error) {
 	if err := checkUint64(count, true); err != nil {
 		return nil, err
+	}
+	if length < 1 || length > security.MaxMetadataBytes {
+		return nil, errors.New("sevenzip: file names exceed metadata limit")
 	}
 
 	external, err := r.ReadByte()
@@ -777,6 +805,9 @@ func readFilesInfo(r util.Reader) (*filesInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	if files > security.MaxArchiveEntries {
+		return nil, errors.New("sevenzip: too many files")
+	}
 
 	f.file = make([]FileHeader, files)
 
@@ -795,6 +826,9 @@ func readFilesInfo(r util.Reader) (*filesInfo, error) {
 		length, err := readUint64(r)
 		if err != nil {
 			return nil, err
+		}
+		if length > security.MaxMetadataBytes {
+			return nil, errors.New("sevenzip: file property exceeds metadata limit")
 		}
 
 		switch property {
@@ -945,13 +979,28 @@ func readHeader(r util.Reader) (*header, error) {
 
 	j := 0
 
+	streams := 0
+	if h.streamsInfo.subStreamsInfo != nil {
+		for _, count := range h.streamsInfo.subStreamsInfo.streams {
+			streams += int(count)
+		}
+	} else {
+		streams = h.streamsInfo.Folders()
+	}
 	for i := range h.filesInfo.file {
 		if h.filesInfo.file[i].isEmptyStream {
 			continue
 		}
 
-		_, h.filesInfo.file[i].UncompressedSize, h.filesInfo.file[i].CRC32 = h.streamsInfo.FileFolderAndSize(j)
+		folder, size, crc, streamErr := h.streamsInfo.FileFolderAndSize(j)
+		if streamErr != nil {
+			return nil, streamErr
+		}
+		_, h.filesInfo.file[i].UncompressedSize, h.filesInfo.file[i].CRC32 = folder, size, crc
 		j++
+	}
+	if j != streams {
+		return nil, errors.New("sevenzip: file and stream counts do not match")
 	}
 
 	return h, nil

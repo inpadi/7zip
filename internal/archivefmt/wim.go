@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/security"
 	"github.com/inpadi/7zip/internal/wim"
 )
 
@@ -26,7 +27,7 @@ type wimArchive struct {
 }
 
 func openWIM(name string) (*wimArchive, error) {
-	file, err := os.Open(name)
+	file, _, err := security.OpenRegularFile(name)
 	if err != nil {
 		return nil, err
 	}
@@ -66,8 +67,8 @@ func (a *wimArchive) Close() error {
 }
 
 func (a *wimArchive) walk(directory *wim.File, prefix string, depth int) error {
-	if depth > 256 {
-		return errors.New("WIM directory nesting exceeds 256 levels")
+	if depth > security.MaxNestingDepth {
+		return fmt.Errorf("WIM directory nesting exceeds %d levels", security.MaxNestingDepth)
 	}
 	children, err := directory.Readdir()
 	if err != nil {
@@ -98,6 +99,9 @@ func (a *wimArchive) walk(directory *wim.File, prefix string, depth int) error {
 			Mode:       mode,
 			Attributes: child.Attributes,
 		}, file: child})
+		if len(a.entries) > security.MaxArchiveEntries {
+			return errors.New("WIM archive contains too many entries")
+		}
 		if child.IsDir() {
 			if err := a.walk(child, strings.TrimSuffix(name, "/"), depth+1); err != nil {
 				return err
@@ -114,12 +118,16 @@ func listWIM(archive string, patterns []string) ([]Entry, error) {
 	}
 	defer input.Close()
 	var entries []Entry
+	var budget security.Budget
 	for _, item := range input.entries {
 		selected, err := archive7z.Matches(item.entry.Name, patterns)
 		if err != nil {
 			return nil, err
 		}
 		if selected {
+			if err := budget.AddEntry(item.entry.Name, item.entry.Size); err != nil {
+				return nil, err
+			}
 			entries = append(entries, item.entry)
 		}
 	}
@@ -132,15 +140,17 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 		return Result{}, err
 	}
 	defer input.Close()
-	root := ""
+	var root *security.Root
 	seen := make(map[string]string)
 	if extract != nil {
 		root, err = extractionRoot(extract.OutputDir)
 		if err != nil {
 			return Result{}, err
 		}
+		defer root.Close()
 	}
 	var result Result
+	var budget security.Budget
 	for _, item := range input.entries {
 		selected, matchErr := archive7z.Matches(item.entry.Name, patterns)
 		if matchErr != nil {
@@ -164,7 +174,7 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 			stream = reader
 		}
 		if extract != nil {
-			n, wrote, extractErr := extractEntry(root, item.entry.Name, item.entry.Mode, item.entry.Modified, stream, *extract, seen)
+			n, wrote, extractErr := extractEntry(root, item.entry.Name, item.entry.Mode, item.entry.Size, stream, *extract, seen, &budget)
 			if reader != nil {
 				closeErr := reader.Close()
 				if extractErr == nil {
@@ -181,9 +191,15 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 			continue
 		}
 		if item.entry.Mode.IsDir() {
+			if err := budget.AddEntry(item.entry.Name, 0); err != nil {
+				return result, err
+			}
 			continue
 		}
-		n, copyErr := io.Copy(dst, stream)
+		if err := budget.AddEntry(item.entry.Name, item.entry.Size); err != nil {
+			return result, err
+		}
+		n, copyErr := budget.Copy(dst, stream, item.entry.Name)
 		closeErr := reader.Close()
 		if copyErr != nil {
 			return result, copyErr

@@ -17,11 +17,13 @@ func NewBlockAllocationTable(fh io.ReadSeeker, offset, maxEntries int64) *BlockA
 }
 
 func (bat *BlockAllocationTable) Get(block int64) (uint32, error) {
-	if block+1 > int64(bat.maxEntries) {
-		return 0, fmt.Errorf("Invalid block %d (max block is %d)", block, bat.maxEntries-1)
+	if block < 0 || block >= bat.maxEntries {
+		return 0, fmt.Errorf("invalid block %d (max block is %d)", block, bat.maxEntries-1)
 	}
-
-	_, err := bat.fh.Seek(int64(bat.offset+block*4), io.SeekStart)
+	if bat.offset < 0 || block > (int64(^uint64(0)>>1)-bat.offset)/4 {
+		return 0, fmt.Errorf("invalid allocation table offset for block %d", block)
+	}
+	_, err := bat.fh.Seek(bat.offset+block*4, io.SeekStart)
 	if err != nil {
 		return 0, err
 	}

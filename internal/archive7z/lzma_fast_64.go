@@ -4,18 +4,11 @@ package archive7z
 
 import (
 	"io"
-	"runtime"
 
-	lzmav2 "github.com/ulikunitz/xz/v2/lzma"
+	"github.com/ulikunitz/xz/lzma"
 )
 
-// newFastLZMA2Writer trades some compression ratio for bounded parallelism at -mx=1/2.
+// newFastLZMA2Writer uses the stable, bounded-memory LZMA2 writer.
 func newFastLZMA2Writer(dst io.Writer, dictionarySize int) (io.WriteCloser, error) {
-	workers := min(runtime.GOMAXPROCS(0), 8)
-	return lzmav2.NewWriter2Options(dst, lzmav2.Writer2Options{
-		WindowSize:    dictionarySize,
-		BufferSize:    2 * dictionarySize,
-		Workers:       workers,
-		ParserOptions: doubleHashParserOptions{},
-	})
+	return (lzma.Writer2Config{DictCap: dictionarySize}).NewWriter2(dst)
 }
