@@ -2,7 +2,7 @@
 
 This fork is migrating the portable archive engine and `7z` command from upstream [7-Zip](https://7-zip.org/) 26.02 to Go. Windows GUI, shell integration, and SDK/COM compatibility are explicitly out of scope.
 
-The migration is incremental. `C/`, `CPP/`, and `Asm/` remain as the pinned upstream reference until every retained CLI and format requirement passes the replacement gates in [MIGRATION.md](MIGRATION.md). They are not linked into the Go executable.
+The migration is incremental, but the legacy `C/`, `CPP/`, and `Asm/` reference trees are no longer included in this repository. Compatibility is checked against the pinned upstream release described in [MIGRATION.md](MIGRATION.md); the Go executable is built entirely from the Go source tree.
 
 ## Download prebuilt binaries
 
@@ -83,7 +83,7 @@ cat payload.bin | 7zip-go a -sidata.bin -so -t7z archive.7z > streamed.7z
 
 The original project has more archive handlers and mutation commands than this milestone. RAR, CAB, RPM, DEB, and other upstream formats are not yet claimed. Delete, rename, multi-volume output, SFX, per-rule recursion modes, interactive prompts, and byte-identical output for commands other than `l -ba` remain.
 
-The 7z reader, format parser, codec registration, AES decoder, and branch filters are fully in-tree under `internal/sevenzip`. That code began from the BSD-licensed `github.com/bodgit/sevenzip` 1.6.4 implementation; its license and provenance are retained beside the source. The native 7z header/folder writer and AES encoder are implemented in-tree from the included upstream sources and [`DOC/7zFormat.txt`](DOC/7zFormat.txt).
+The 7z reader, format parser, codec registration, AES decoder, and branch filters are fully in-tree under `internal/sevenzip`. That code began from the BSD-licensed `github.com/bodgit/sevenzip` 1.6.4 implementation; its license and provenance are retained beside the source. The native 7z header/folder writer and AES encoder are implemented in-tree from the upstream implementation and [`DOC/7zFormat.txt`](DOC/7zFormat.txt).
 
 Upstream licensing material remains in [`DOC/License.txt`](DOC/License.txt), [`DOC/copying.txt`](DOC/copying.txt), and [`DOC/unRarLicense.txt`](DOC/unRarLicense.txt). Dependency versions are locked by `go.mod` and `go.sum`.
 

@@ -40,9 +40,9 @@ Archive updates are transactional rewrites. Existing entries not replaced by an 
 4. **Mutation parity**: delete, rename, update action rules, links, alternate streams, volumes, and SFX. Stream I/O is implemented.
 5. **Remaining format handlers**: ISO/WIM/VHD/VHDX read slices are implemented. Continue in risk-based groups with explicit read/write matrices and fixtures.
 6. **CLI parity**: list files, core wildcards, include/exclude masks, tuning, and bare list rows are implemented. Warnings, prompts, routing, and remaining output still need differential tests.
-7. **Legacy removal**: delete `C/`, `CPP/`, and `Asm/` when every retained portable surface passes the gates below. Keep format and licensing documentation.
+7. **Legacy removal**: completed. The `C/`, `CPP/`, and `Asm/` reference trees were removed while format and licensing documentation was retained. Compatibility testing uses the pinned external upstream oracle.
 
-## Deletion gates
+## Remaining compatibility gates
 
 - Every advertised command, switch, container, codec, encryption mode, and metadata type has a checked compatibility row.
 - Bidirectional fixtures pass against pinned upstream on each supported OS where the format exists.
@@ -52,4 +52,4 @@ Archive updates are transactional rewrites. Existing entries not replaced by an 
 - Performance and memory are measured against upstream on representative archives.
 - Licensing notices for retained, translated, and third-party components are complete.
 
-Deleting the reference implementation before those gates pass would remove still-required portable behavior and make parity regressions harder to diagnose.
+Removal of the reference source does not claim that these gates are complete. Missing behavior remains explicit in the matrix above, and parity regressions must be diagnosed against the pinned external upstream build and bidirectional fixtures.
