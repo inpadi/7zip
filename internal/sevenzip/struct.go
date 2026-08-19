@@ -93,7 +93,7 @@ func (f *folder) findOutBindPair(i uint64) *bindPair {
 func (f *folder) coderReader(readers []io.ReadCloser, coder uint64, password string) (io.ReadCloser, bool, error) {
 	dcomp := decompressor(f.coder[coder].id)
 	if dcomp == nil {
-		return nil, false, errAlgorithm
+		return nil, false, fmt.Errorf("%w: method %x", errAlgorithm, f.coder[coder].id)
 	}
 
 	cr, err := dcomp(f.coder[coder].properties, f.size[coder], readers)

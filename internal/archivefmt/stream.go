@@ -192,12 +192,20 @@ func openStream(archive string, format Format) (*streamInput, error) {
 	case FormatBzip2:
 		input.reader = bzip2.NewReader(file)
 	case FormatXZ:
-		reader, xzErr := xz.NewReader(file)
+		reader, xzErr := newXZReader(file)
 		if xzErr != nil {
 			_ = file.Close()
 			return nil, xzErr
 		}
 		input.reader = reader
+		input.close = func() error {
+			readerErr := reader.Close()
+			fileErr := file.Close()
+			if readerErr != nil {
+				return readerErr
+			}
+			return fileErr
+		}
 	case FormatZstd:
 		reader, zstdErr := zstd.NewReader(file)
 		if zstdErr != nil {

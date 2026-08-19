@@ -4,21 +4,33 @@ This fork is migrating the portable archive engine and `7z` command from upstrea
 
 The migration is incremental. `C/`, `CPP/`, and `Asm/` remain as the pinned upstream reference until every retained CLI and format requirement passes the replacement gates in [MIGRATION.md](MIGRATION.md). They are not linked into the Go executable.
 
-## Download signed Windows binaries
+## Download prebuilt binaries
 
-| Platform | Download |
-| --- | --- |
-| Windows x64 | [Download `i7z.exe`](Out/windows/amd64/i7z.exe?raw=1) |
-| Windows ARM64 | [Download `i7z.exe`](Out/windows/arm64/i7z.exe?raw=1) |
-| Windows x86 (32-bit) | [Download `i7z.exe`](Out/windows/386/i7z.exe?raw=1) |
+| Operating system | Architecture | Download |
+| --- | --- | --- |
+| Windows | x64 | [Download `i7z.exe`](Out/windows/amd64/i7z.exe?raw=1) |
+| Windows | ARM64 | [Download `i7z.exe`](Out/windows/arm64/i7z.exe?raw=1) |
+| Windows | x86 (32-bit) | [Download `i7z.exe`](Out/windows/386/i7z.exe?raw=1) |
+| Linux | x64 | [Download `i7z`](Out/linux/amd64/i7z?raw=1) |
+| Linux | ARM64 | [Download `i7z`](Out/linux/arm64/i7z?raw=1) |
+| Linux | ARM (32-bit) | [Download `i7z`](Out/linux/arm/i7z?raw=1) |
+| Linux | x86 (32-bit) | [Download `i7z`](Out/linux/386/i7z?raw=1) |
+| macOS | Apple silicon (ARM64) | [Download `i7z`](Out/darwin/arm64/i7z?raw=1) |
+| macOS | Intel x64 | [Download `i7z`](Out/darwin/amd64/i7z?raw=1) |
 
-These binaries are Authenticode-signed by `inpadi ApS`. Verify the signature after downloading:
+The Windows binaries are Authenticode-signed by `inpadi ApS`. Verify the signature after downloading:
 
 ```powershell
 Get-AuthenticodeSignature .\i7z.exe | Format-List Status, SignerCertificate
 ```
 
-A valid official binary reports `Status: Valid`. See [RELEASE.md](RELEASE.md) for the complete release and verification policy.
+A valid Windows binary reports `Status: Valid`. Linux and macOS users may need to make the downloaded file executable:
+
+```sh
+chmod +x i7z
+```
+
+The binaries are built with `CGO_ENABLED=0`. See [RELEASE.md](RELEASE.md) for the complete release and verification policy.
 
 ## Implemented
 
@@ -57,6 +69,17 @@ go vet ./...
 ```
 
 When `7z`, `7zz`, or `7za` is installed, the tests run bidirectional interoperability checks for writable formats and upstream-consumer checks for read-only images. They cover solid and non-solid 7z blocks, encrypted data and headers, wrong passwords, updates, each advertised format, and payload verification.
+
+On Windows, the standalone PowerShell harness builds the current `i7z` source and hash-verifies self- and cross-extraction for every accepted compression method:
+
+```powershell
+.\test-i7z-interoperability.ps1
+.\test-i7z-interoperability.ps1 -SourcePath 'D:\test-data' -CompressionLevel 9
+```
+
+The harness reports compression and extraction time, throughput, archive size, requested level, compression ratio, and space saved for both tools. It generates a small payload when `-SourcePath` is omitted; directory sources are packaged once as an uncompressed stream for single-stream codecs, outside the timed operations.
+
+It uses `C:\Program Files\7-Zip\7z.exe` as the reference executable by default. Use `-SevenZipPath` or `-I7zPath` to test different binaries, and `-KeepArtifacts` to retain the generated archives and extraction directories.
 
 Examples:
 

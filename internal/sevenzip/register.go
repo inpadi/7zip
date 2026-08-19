@@ -54,6 +54,8 @@ func init() {
 	RegisterDecompressor([]byte{0x03, 0x03, 0x01, 0x1b}, Decompressor(bcj2.NewReader))
 	// PPC
 	RegisterDecompressor([]byte{0x03, 0x03, 0x02, 0x05}, Decompressor(bra.NewPPCReader))
+	// IA-64
+	RegisterDecompressor([]byte{0x03, 0x03, 0x04, 0x01}, Decompressor(bra.NewIA64Reader))
 	// ARM
 	RegisterDecompressor([]byte{0x03, 0x03, 0x05, 0x01}, Decompressor(bra.NewARMReader))
 	// SPARC
