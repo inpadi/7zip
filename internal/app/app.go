@@ -24,8 +24,10 @@ const (
 )
 
 const (
-	version     = "26.02-go.3"
-	versionDate = "2026-06-25"
+	version      = "26.02-go.3"
+	versionDate  = "2026-06-25"
+	publisher    = "inpadi ApS"
+	supportEmail = "support@inpadi.com"
 )
 
 // Run executes one command and returns a 7-Zip-compatible process exit code.
@@ -432,7 +434,8 @@ func printBanner(w io.Writer) {
 	case "386":
 		arch = "x86"
 	}
-	fmt.Fprintf(w, "\n7-Zip Go %s (%s) : 7-Zip compatibility target 26.02 : %s\n\n", version, arch, versionDate)
+	fmt.Fprintf(w, "\n7-Zip Go %s (%s) : 7-Zip compatibility target 26.02 : %s\n", version, arch, versionDate)
+	fmt.Fprintf(w, "This build is from %s - %s for support / questions\n\n", publisher, supportEmail)
 }
 
 func printUsage(w io.Writer) {

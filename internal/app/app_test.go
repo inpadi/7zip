@@ -19,6 +19,9 @@ func TestRunHelpAndUserError(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage: 7zip") {
 		t.Fatalf("help output = %q", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "This build is from inpadi ApS - support@inpadi.com for support / questions") {
+		t.Fatalf("help output lacks publisher support header: %q", stdout.String())
+	}
 
 	stdout.Reset()
 	if code := Run([]string{"a", "-mx10", "archive.7z", "file"}, &stdout, &stderr); code != ExitUserError {
@@ -174,7 +177,9 @@ func TestRunBareListOutput(t *testing.T) {
 		t.Fatalf("bare list code = %d, stderr = %s", code, stderr.String())
 	}
 	output := strings.TrimRight(stdout.String(), "\r\n")
-	if strings.Contains(output, "7-Zip") || strings.Contains(output, "Listing archive") || strings.Contains(output, "Date") {
+	if strings.Contains(output, "7-Zip") || strings.Contains(output, "inpadi ApS") ||
+		strings.Contains(output, "support@inpadi.com") || strings.Contains(output, "Listing archive") ||
+		strings.Contains(output, "Date") {
 		t.Fatalf("bare list contains headers: %q", output)
 	}
 	if lines := strings.Split(output, "\n"); len(lines) != 1 {
