@@ -54,9 +54,13 @@ SOFTWARE.
 Vendored components retain their original licenses and provenance notices:
 
 - `internal/sevenzip/LICENSE` and `internal/sevenzip/ORIGIN.md`
+- `internal/native/sdk7z/README.md`
 - `internal/vdisk/LICENSE` and `internal/vdisk/ORIGIN.md`
 - `internal/wim/LICENSE` and `internal/wim/ORIGIN.md`
 - `internal/wim/xpress/LICENSE` and `internal/wim/xpress/ORIGIN.md`
+- `internal/xz/LICENSE` and `internal/xz/README.md`
+- `third_party/pbzip2/LICENSE`, `third_party/pbzip2/GO-LICENSE`,
+  `third_party/pbzip2/GO-PATENTS`, and `third_party/pbzip2/ORIGIN.md`
 
 Go module dependencies are identified in `go.mod` and `go.sum` and remain
 subject to their respective upstream licenses.

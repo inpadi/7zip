@@ -47,13 +47,22 @@ const (
 	OverwriteSkip
 )
 
+// PublicationMode controls how newly extracted files become visible.
+type PublicationMode uint8
+
+const (
+	PublicationDirect PublicationMode = iota
+	PublicationAtomic
+)
+
 // ExtractOptions configures extraction without exposing CLI internals.
 type ExtractOptions struct {
-	OutputDir string
-	Patterns  []string
-	Password  string
-	Flatten   bool
-	Overwrite OverwritePolicy
+	OutputDir   string
+	Patterns    []string
+	Password    string
+	Flatten     bool
+	Overwrite   OverwritePolicy
+	Publication PublicationMode
 }
 
 // AddOptions configures native 7z creation and updates.
@@ -61,6 +70,7 @@ type AddOptions struct {
 	Solid            bool
 	Password         string
 	HeaderEncryption bool
+	DisableFilters   bool
 	Level            int
 	LevelDefined     bool
 	Method           string
@@ -77,24 +87,19 @@ type inputFile struct {
 }
 
 func (i inputFile) open() (*os.File, error) {
-	before, err := i.root.Lstat(i.relative)
-	if err != nil {
-		return nil, err
-	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || !os.SameFile(i.info, before) {
-		return nil, fmt.Errorf("input %q changed after it was enumerated", i.path)
-	}
+	// Root.Open contains any link resolution; the descriptor identity check
+	// prevents a post-enumeration path change from redirecting the input.
 	file, err := i.root.Open(i.relative)
 	if err != nil {
 		return nil, err
 	}
 	after, err := file.Stat()
-	if err != nil || !os.SameFile(before, after) {
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(i.info, after) {
 		file.Close()
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("input %q changed while it was opened", i.path)
+		return nil, fmt.Errorf("input %q changed after it was enumerated", i.path)
 	}
 	return file, nil
 }
@@ -153,6 +158,14 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 	if len(inputs) == 0 {
 		return result, errors.New("no files to process")
 	}
+	level := -1
+	if options.LevelDefined {
+		level = options.Level
+	}
+	directories, groups, err := planInputGroups(inputs, executableFiltersEnabled(options, level))
+	if err != nil {
+		return result, err
+	}
 	output, err := security.CreateOutput(archiveAbs)
 	if err != nil {
 		return result, err
@@ -175,10 +188,6 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 
 	temp := output.File()
 
-	level := -1
-	if options.LevelDefined {
-		level = options.Level
-	}
 	zw, err := newWriter(temp, writerOptions{
 		solid:            options.Solid,
 		password:         options.Password,
@@ -189,6 +198,9 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 	if err != nil {
 		return result, fmt.Errorf("create 7z writer: %w", err)
 	}
+	defer func() {
+		_ = zw.Close()
+	}()
 
 	replacements := make(map[string]struct{}, len(inputs))
 	for _, input := range inputs {
@@ -243,7 +255,7 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 		}
 	}
 
-	for _, input := range inputs {
+	for _, input := range directories {
 		if err := budget.AddEntry(input.name, uint64(max(input.info.Size(), 0))); err != nil {
 			return result, err
 		}
@@ -253,35 +265,67 @@ func AddWithOptions(archive string, sources []string, options AddOptions) (resul
 			Attributes: fileAttributes(input.info.Mode()),
 			IsDir:      input.info.IsDir(),
 		}
-		if header.IsDir {
-			if addErr := zw.addDirectory(header); addErr != nil {
-				return result, fmt.Errorf("add directory %q: %w", input.name, addErr)
+		if addErr := zw.addDirectory(header); addErr != nil {
+			return result, fmt.Errorf("add directory %q: %w", input.name, addErr)
+		}
+	}
+
+	for _, group := range groups {
+		if options.Solid {
+			if beginErr := zw.beginFolder(group.filter, group.expectedSize, true); beginErr != nil {
+				return result, fmt.Errorf("start executable filter group: %w", beginErr)
 			}
-			continue
 		}
-		dst, createErr := zw.create(header)
-		if createErr != nil {
-			return result, fmt.Errorf("add %q: %w", input.name, createErr)
+		for _, input := range group.files {
+			if err := budget.AddEntry(input.name, uint64(max(input.info.Size(), 0))); err != nil {
+				return result, err
+			}
+			if input.info.IsDir() {
+				header := writerFileHeader{
+					Name:       input.name,
+					Modified:   input.info.ModTime(),
+					Attributes: fileAttributes(input.info.Mode()),
+					IsDir:      true,
+				}
+				if addErr := zw.addDirectory(header); addErr != nil {
+					return result, fmt.Errorf("add directory %q: %w", input.name, addErr)
+				}
+				continue
+			}
+			if !options.Solid {
+				if beginErr := zw.beginFolder(group.filter, uint64(max(input.info.Size(), 0)), true); beginErr != nil {
+					return result, fmt.Errorf("start executable filter for %q: %w", input.name, beginErr)
+				}
+			}
+			header := writerFileHeader{
+				Name:       input.name,
+				Modified:   input.info.ModTime(),
+				Attributes: fileAttributes(input.info.Mode()),
+			}
+			dst, createErr := zw.create(header)
+			if createErr != nil {
+				return result, fmt.Errorf("add %q: %w", input.name, createErr)
+			}
+			src, openErr := input.open()
+			if openErr != nil {
+				_ = dst.Close()
+				return result, fmt.Errorf("open %q: %w", input.path, openErr)
+			}
+			n, copyErr := budget.Copy(dst, src, input.name)
+			closeSrcErr := src.Close()
+			closeDstErr := dst.Close()
+			if copyErr != nil {
+				return result, fmt.Errorf("add %q: %w", input.name, copyErr)
+			}
+			if closeSrcErr != nil {
+				return result, fmt.Errorf("close %q: %w", input.path, closeSrcErr)
+			}
+			if closeDstErr != nil {
+				return result, fmt.Errorf("finish %q: %w", input.name, closeDstErr)
+			}
+			result.Files++
+			result.Bytes += uint64(n)
 		}
-		src, openErr := input.open()
-		if openErr != nil {
-			_ = dst.Close()
-			return result, fmt.Errorf("open %q: %w", input.path, openErr)
-		}
-		n, copyErr := budget.Copy(dst, src, input.name)
-		closeSrcErr := src.Close()
-		closeDstErr := dst.Close()
-		if copyErr != nil {
-			return result, fmt.Errorf("add %q: %w", input.name, copyErr)
-		}
-		if closeSrcErr != nil {
-			return result, fmt.Errorf("close %q: %w", input.path, closeSrcErr)
-		}
-		if closeDstErr != nil {
-			return result, fmt.Errorf("finish %q: %w", input.name, closeDstErr)
-		}
-		result.Files++
-		result.Bytes += uint64(n)
 	}
 	if err = zw.Close(); err != nil {
 		return result, fmt.Errorf("finish archive: %w", err)
@@ -452,6 +496,8 @@ func Extract(archive string, opts ExtractOptions) (Result, error) {
 		return Result{}, err
 	}
 	defer root.Close()
+	parents := security.NewParentCache(root, opts.Publication == PublicationAtomic)
+	defer parents.Close()
 
 	zr, err := openReader(archive, opts.Password)
 	if err != nil {
@@ -496,86 +542,87 @@ func Extract(archive string, opts ExtractOptions) (Result, error) {
 		seen[key] = file.Name
 
 		if mode.IsDir() {
-			directory, err := root.MkdirRoot(relative, 0o755)
+			_, err := parents.Directory(relative, 0o755)
 			if err != nil {
 				return result, fmt.Errorf("create directory %q: %w", relative, err)
-			}
-			if err := directory.Close(); err != nil {
-				return result, fmt.Errorf("close directory %q: %w", relative, err)
 			}
 			continue
 		}
 		if mode.Type() != 0 {
 			return result, fmt.Errorf("refusing unsupported special entry %q (%s)", file.Name, mode.Type())
 		}
-		parent, err := root.MkdirRoot(filepath.Dir(relative), 0o755)
+		parent, err := parents.Directory(filepath.Dir(relative), 0o755)
 		if err != nil {
 			return result, fmt.Errorf("create parent for %q: %w", relative, err)
 		}
 		target := filepath.Base(relative)
-		existing, statErr := parent.Lstat(target)
-		if statErr == nil {
-			if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
-				parent.Close()
-				return result, fmt.Errorf("refusing to replace non-regular path %q", relative)
+		var existing fs.FileInfo
+		var statErr error
+		direct := false
+		var tempName string
+		var temp *os.File
+		var tempErr error
+		if opts.Publication == PublicationDirect {
+			tempName = target
+			temp, tempErr = parent.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if tempErr == nil {
+				direct = true
+			} else if !errors.Is(tempErr, fs.ErrExist) {
+				return result, fmt.Errorf("create %q: %w", relative, tempErr)
 			}
-			switch opts.Overwrite {
-			case OverwriteSkip:
-				parent.Close()
-				continue
-			case OverwriteAll:
-			default:
-				parent.Close()
-				return result, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
-			}
-		} else if !errors.Is(statErr, fs.ErrNotExist) {
-			parent.Close()
-			return result, statErr
 		}
-		tempName, temp, tempErr := parent.CreateTemp()
+		if !direct {
+			existing, statErr = parent.Lstat(target)
+			if statErr == nil {
+				if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
+					return result, fmt.Errorf("refusing to replace non-regular path %q", relative)
+				}
+				switch opts.Overwrite {
+				case OverwriteSkip:
+					continue
+				case OverwriteAll:
+				default:
+					return result, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+				}
+			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				return result, statErr
+			}
+			tempName, temp, tempErr = parent.CreateTemp()
+		}
 		if tempErr != nil {
-			parent.Close()
 			return result, fmt.Errorf("create %q: %w", relative, tempErr)
 		}
 		n, checksum, readErr := readFile(file, temp, &budget)
-		if readErr == nil {
-			readErr = temp.Chmod(security.SafeFileMode(mode))
+		if readErr == nil && file.CRC32 != 0 && checksum != file.CRC32 {
+			readErr = fmt.Errorf("CRC mismatch: got %08X, want %08X", checksum, file.CRC32)
 		}
 		if readErr == nil {
+			readErr = security.ApplySafeFileMode(temp, mode)
+		}
+		if readErr == nil && !direct {
 			readErr = temp.Sync()
 		}
 		closeErr := temp.Close()
 		if readErr != nil {
 			_ = parent.Remove(tempName)
-			parent.Close()
 			return result, fmt.Errorf("extract %q: %w", file.Name, readErr)
 		}
 		if closeErr != nil {
 			_ = parent.Remove(tempName)
-			parent.Close()
 			return result, fmt.Errorf("close %q: %w", relative, closeErr)
 		}
-		if file.CRC32 != 0 && checksum != file.CRC32 {
-			_ = parent.Remove(tempName)
-			parent.Close()
-			return result, fmt.Errorf("extract %q: CRC mismatch: got %08X, want %08X", file.Name, checksum, file.CRC32)
+		if direct {
+			result.Files++
+			result.Bytes += uint64(n)
+			continue
 		}
 		if opts.Overwrite == OverwriteAll {
-			if statErr == nil {
-				if removeErr := parent.Remove(target); removeErr != nil {
-					_ = parent.Remove(tempName)
-					parent.Close()
-					return result, removeErr
-				}
-			}
 			if renameErr := parent.Rename(tempName, target); renameErr != nil {
 				_ = parent.Remove(tempName)
-				parent.Close()
 				return result, fmt.Errorf("publish %q: %w", relative, renameErr)
 			}
 		} else if linkErr := parent.Link(tempName, target); linkErr != nil {
 			_ = parent.Remove(tempName)
-			parent.Close()
 			if opts.Overwrite == OverwriteSkip && errors.Is(linkErr, fs.ErrExist) {
 				continue
 			}
@@ -584,11 +631,7 @@ func Extract(archive string, opts ExtractOptions) (Result, error) {
 			}
 			return result, fmt.Errorf("publish %q without replacement: %w", relative, linkErr)
 		} else if removeErr := parent.Remove(tempName); removeErr != nil {
-			parent.Close()
 			return result, removeErr
-		}
-		if closeParentErr := parent.Close(); closeParentErr != nil {
-			return result, closeParentErr
 		}
 		result.Files++
 		result.Bytes += uint64(n)

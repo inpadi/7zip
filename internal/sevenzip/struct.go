@@ -202,14 +202,16 @@ func (f *folder) unpackSize() uint64 {
 }
 
 type unpackInfo struct {
-	folder []*folder
-	digest []uint32
+	folder        []*folder
+	digest        []uint32
+	digestDefined []bool
 }
 
 type subStreamsInfo struct {
-	streams []uint64
-	size    []uint64
-	digest  []uint32
+	streams       []uint64
+	size          []uint64
+	digest        []uint32
+	digestDefined []bool
 }
 
 type streamsInfo struct {
@@ -253,7 +255,9 @@ func (si *streamsInfo) FileFolderAndSize(file int) (int, uint64, uint32, error) 
 			if file >= len(si.subStreamsInfo.digest) {
 				return 0, 0, 0, errors.New("sevenzip: missing substream checksum")
 			}
-			crc = si.subStreamsInfo.digest[file]
+			if len(si.subStreamsInfo.digestDefined) == 0 || si.subStreamsInfo.digestDefined[file] {
+				crc = si.subStreamsInfo.digest[file]
+			}
 		}
 	} else {
 		folder = file
@@ -266,7 +270,9 @@ func (si *streamsInfo) FileFolderAndSize(file int) (int, uint64, uint32, error) 
 			if folder >= len(si.unpackInfo.digest) {
 				return 0, 0, 0, errors.New("sevenzip: missing folder checksum")
 			}
-			crc = si.unpackInfo.digest[folder]
+			if len(si.unpackInfo.digestDefined) == 0 || si.unpackInfo.digestDefined[folder] {
+				crc = si.unpackInfo.digest[folder]
+			}
 		}
 		return folder, si.unpackInfo.folder[folder].unpackSize(), crc, nil
 	}
@@ -305,6 +311,9 @@ func (si *streamsInfo) validate() error {
 	if len(si.unpackInfo.digest) != 0 && len(si.unpackInfo.digest) != len(si.unpackInfo.folder) {
 		return errors.New("sevenzip: folder checksum count does not match")
 	}
+	if len(si.unpackInfo.digestDefined) != 0 && len(si.unpackInfo.digestDefined) != len(si.unpackInfo.folder) {
+		return errors.New("sevenzip: folder checksum definition count does not match")
+	}
 	if si.subStreamsInfo != nil {
 		if len(si.subStreamsInfo.streams) != len(si.unpackInfo.folder) {
 			return errors.New("sevenzip: substream folder count does not match")
@@ -320,6 +329,9 @@ func (si *streamsInfo) validate() error {
 		}
 		if len(si.subStreamsInfo.digest) != 0 && uint64(len(si.subStreamsInfo.digest)) != files {
 			return errors.New("sevenzip: substream checksum count does not match")
+		}
+		if len(si.subStreamsInfo.digestDefined) != 0 && uint64(len(si.subStreamsInfo.digestDefined)) != files {
+			return errors.New("sevenzip: substream checksum definition count does not match")
 		}
 	}
 	return nil
@@ -428,7 +440,8 @@ func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string, 
 
 	fr := newFolderReadCloser(out[unbound[0]], int64(f.unpackSize()), hasEncryption, checksum) //nolint:gosec
 
-	if si.unpackInfo.digest != nil {
+	if si.unpackInfo.digest != nil &&
+		(len(si.unpackInfo.digestDefined) == 0 || si.unpackInfo.digestDefined[folder]) {
 		return fr, si.unpackInfo.digest[folder], hasEncryption, nil
 	}
 

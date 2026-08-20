@@ -16,11 +16,14 @@ import (
 type Entry = archive7z.Entry
 type Result = archive7z.Result
 type OverwritePolicy = archive7z.OverwritePolicy
+type PublicationMode = archive7z.PublicationMode
 
 const (
-	OverwriteNever = archive7z.OverwriteNever
-	OverwriteAll   = archive7z.OverwriteAll
-	OverwriteSkip  = archive7z.OverwriteSkip
+	OverwriteNever    = archive7z.OverwriteNever
+	OverwriteAll      = archive7z.OverwriteAll
+	OverwriteSkip     = archive7z.OverwriteSkip
+	PublicationDirect = archive7z.PublicationDirect
+	PublicationAtomic = archive7z.PublicationAtomic
 )
 
 type Format string
@@ -49,6 +52,8 @@ type AddOptions struct {
 	SolidDefined     bool
 	Password         string
 	HeaderEncryption bool
+	DisableFilters   bool
+	FiltersDefined   bool
 	Level            int
 	LevelDefined     bool
 	Method           string
@@ -57,12 +62,13 @@ type AddOptions struct {
 }
 
 type ExtractOptions struct {
-	Format    string
-	OutputDir string
-	Patterns  []string
-	Password  string
-	Flatten   bool
-	Overwrite OverwritePolicy
+	Format      string
+	OutputDir   string
+	Patterns    []string
+	Password    string
+	Flatten     bool
+	Overwrite   OverwritePolicy
+	Publication PublicationMode
 }
 
 func Resolve(explicit, archive string) (Format, error) {
@@ -154,6 +160,9 @@ func Add(archive string, sources []string, options AddOptions) (Result, error) {
 	if format != Format7z && options.SolidDefined {
 		return Result{}, fmt.Errorf("solid mode is only supported for 7z archives")
 	}
+	if format != Format7z && options.FiltersDefined {
+		return Result{}, fmt.Errorf("executable filters are only supported for 7z archives")
+	}
 	if err := validateCompression(format, options.Method); err != nil {
 		return Result{}, err
 	}
@@ -169,6 +178,7 @@ func Add(archive string, sources []string, options AddOptions) (Result, error) {
 			Solid:            options.Solid,
 			Password:         options.Password,
 			HeaderEncryption: options.HeaderEncryption,
+			DisableFilters:   options.DisableFilters,
 			Level:            level,
 			LevelDefined:     true,
 			Method:           options.Method,
@@ -194,6 +204,9 @@ func CreateEmpty(archive string, options AddOptions) (err error) {
 	if format != Format7z && (options.Password != "" || options.HeaderEncryption) {
 		return fmt.Errorf("password encryption is not implemented for %s archives", format)
 	}
+	if format != Format7z && options.FiltersDefined {
+		return fmt.Errorf("executable filters are only supported for 7z archives")
+	}
 	if err := validateCompression(format, options.Method); err != nil {
 		return err
 	}
@@ -208,6 +221,7 @@ func CreateEmpty(archive string, options AddOptions) (err error) {
 			Solid:            options.Solid,
 			Password:         options.Password,
 			HeaderEncryption: options.HeaderEncryption,
+			DisableFilters:   options.DisableFilters,
 			Level:            options.Level,
 			LevelDefined:     options.LevelDefined,
 			Method:           options.Method,
@@ -357,11 +371,12 @@ func Extract(archive string, options ExtractOptions) (Result, error) {
 	}
 	if format == Format7z {
 		return archive7z.Extract(archive, archive7z.ExtractOptions{
-			OutputDir: options.OutputDir,
-			Patterns:  options.Patterns,
-			Password:  options.Password,
-			Flatten:   options.Flatten,
-			Overwrite: options.Overwrite,
+			OutputDir:   options.OutputDir,
+			Patterns:    options.Patterns,
+			Password:    options.Password,
+			Flatten:     options.Flatten,
+			Overwrite:   options.Overwrite,
+			Publication: options.Publication,
 		})
 	}
 	if format == FormatZip {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/inpadi/7zip/internal/archive7z"
 	"github.com/inpadi/7zip/internal/security"
+	kpflate "github.com/klauspost/compress/flate"
 )
 
 type zipInput struct {
@@ -27,6 +28,9 @@ func openZip(name string) (*zipInput, error) {
 		file.Close()
 		return nil, err
 	}
+	reader.RegisterDecompressor(zip.Deflate, func(src io.Reader) io.ReadCloser {
+		return kpflate.NewReader(src)
+	})
 	return &zipInput{Reader: reader, file: file}, nil
 }
 
@@ -304,6 +308,8 @@ func extractZip(archive string, options ExtractOptions) (Result, error) {
 		return Result{}, err
 	}
 	defer root.Close()
+	parents := extractionParents(root, options)
+	defer parents.Close()
 	zr, err := openZip(archive)
 	if err != nil {
 		return Result{}, err
@@ -334,7 +340,7 @@ func extractZip(archive string, options ExtractOptions) (Result, error) {
 		if src != nil {
 			reader = src
 		}
-		n, wrote, extractErr := extractEntry(root, file.Name, file.Mode(), file.UncompressedSize64, reader, options, seen, &budget)
+		n, wrote, extractErr := extractEntry(parents, file.Name, file.Mode(), file.UncompressedSize64, reader, options, seen, &budget)
 		if src != nil {
 			closeErr := src.Close()
 			if extractErr == nil {

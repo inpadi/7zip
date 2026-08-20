@@ -50,3 +50,46 @@ jobs:
       - name: Security static analysis
         if: runner.os == 'Linux'
         run: go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -exclude=G104,G115 ./...
+
+  native-windows-amd64:
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Configure private temporary directory
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP "i7z-native"
+          New-Item -ItemType Directory -Force -Path $path | Out-Null
+          "TMPDIR=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify C toolchain
+        run: gcc --version
+      - name: Test native backend
+        run: go test ./...
+      - name: Test scalar native backend
+        run: go test -tags noasm ./...
+      - name: Test explicit portable fallback
+        run: go test -tags purego ./...
+      - name: Native backend race detector
+        run: go test -race ./internal/native/... ./internal/archive7z ./internal/archivefmt ./internal/xz/...
+      - name: Vet native backend
+        run: go vet ./...
+      - name: Verify accelerated release configuration
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP "i7z-native.exe"
+          go build -trimpath -o $binary ./cmd/7zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $symbols = go tool nm $binary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($symbol in @("LzmaDec_DecodeReal_3", "i7z_lzma_encoder_create")) {
+            if (-not ($symbols | Select-String -SimpleMatch -Quiet $symbol)) {
+              throw "native release binary is missing $symbol"
+            }
+          }

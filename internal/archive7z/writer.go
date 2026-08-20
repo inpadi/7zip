@@ -2,6 +2,7 @@ package archive7z
 
 import (
 	"bytes"
+	"compress/flate"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -11,10 +12,13 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"runtime"
 	"time"
 	"unicode/utf16"
 
-	"github.com/ulikunitz/xz/lzma"
+	"github.com/inpadi/7zip/internal/native/lzmaenc"
+	"github.com/inpadi/7zip/internal/sevenzip"
+	"github.com/inpadi/7zip/internal/xz/lzma"
 )
 
 const (
@@ -45,12 +49,21 @@ const (
 var method7zAES = []byte{0x06, 0xF1, 0x07, 0x01}
 
 var (
-	methodCopy  = []byte{0x00}
-	methodLZMA  = []byte{0x03, 0x01, 0x01}
-	methodLZMA2 = []byte{0x21}
+	methodCopy    = []byte{0x00}
+	methodLZMA    = []byte{0x03, 0x01, 0x01}
+	methodLZMA2   = []byte{0x21}
+	methodDeflate = []byte{0x04, 0x01, 0x08}
+	methodBCJ     = []byte{0x03, 0x03, 0x01, 0x03}
+	methodARM64   = []byte{0x0a}
+	methodIA64    = []byte{0x03, 0x03, 0x04, 0x01}
 )
 
 const idEncodedHeader = 0x17
+
+// The SDK's two-thread BT match finder can require several times its
+// dictionary size. This ceiling accommodates the 256 MiB presets while still
+// making every native allocation fail closed.
+const maxNativeEncoderMemory uint64 = 4 << 30
 
 type writerOptions struct {
 	solid            bool
@@ -78,6 +91,7 @@ type writerFolder struct {
 	files            []*writerFile
 	method           []byte
 	properties       []byte
+	filterMethod     []byte
 	aesProperties    []byte
 	packSize         uint64
 	compressedSize   uint64
@@ -86,13 +100,16 @@ type writerFolder struct {
 }
 
 type archiveWriter struct {
-	w       io.WriteSeeker
-	options writerOptions
-	files   []*writerFile
-	folders []*writerFolder
-	current *fileWriter
-	solid   *streamEncoder
-	closed  bool
+	w                   io.WriteSeeker
+	options             writerOptions
+	files               []*writerFile
+	folders             []*writerFolder
+	current             *fileWriter
+	solid               *streamEncoder
+	filter              sevenzip.BranchFilter
+	expectedSize        uint64
+	expectedSizeDefined bool
+	closed              bool
 }
 
 type fileWriter struct {
@@ -145,6 +162,27 @@ func (w *archiveWriter) addDirectory(header writerFileHeader) error {
 	return nil
 }
 
+func (w *archiveWriter) beginFolder(filter sevenzip.BranchFilter, expectedSize uint64, expectedSizeDefined bool) error {
+	if w.closed {
+		return errors.New("7z writer is closed")
+	}
+	if w.current != nil {
+		if err := w.current.Close(); err != nil {
+			return err
+		}
+	}
+	if w.solid != nil {
+		if err := w.solid.Close(); err != nil {
+			return err
+		}
+		w.solid = nil
+	}
+	w.filter = filter
+	w.expectedSize = expectedSize
+	w.expectedSizeDefined = expectedSizeDefined
+	return nil
+}
+
 func (w *archiveWriter) create(header writerFileHeader) (io.WriteCloser, error) {
 	if w.closed {
 		return nil, errors.New("7z writer is closed")
@@ -166,7 +204,10 @@ func (w *archiveWriter) create(header writerFileHeader) (io.WriteCloser, error) 
 		folder := &writerFolder{}
 		w.folders = append(w.folders, folder)
 		var err error
-		stream, err = newStreamEncoder(w.w, folder, w.options.password, w.options.method, w.options.level)
+		stream, err = newStreamEncoder(
+			w.w, folder, w.options.password, w.options.method, w.options.level,
+			w.filter, w.expectedSize, w.expectedSizeDefined,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -186,8 +227,30 @@ func (w *archiveWriter) create(header writerFileHeader) (io.WriteCloser, error) 
 	return w.current, nil
 }
 
-func newStreamEncoder(dst io.Writer, folder *writerFolder, password, method string, level int) (*streamEncoder, error) {
+func newStreamEncoder(
+	dst io.Writer,
+	folder *writerFolder,
+	password, method string,
+	level int,
+	filter sevenzip.BranchFilter,
+	expectedSize uint64,
+	expectedSizeDefined bool,
+) (*streamEncoder, error) {
 	dictionarySize := dictionaryForLevel(level)
+	if method == "" {
+		if level == 0 {
+			method = "copy"
+		} else {
+			method = "lzma2"
+		}
+	}
+	if method == "store" {
+		method = "copy"
+	}
+	if filter != sevenzip.BranchFilterNone && method != "lzma" && method != "lzma2" {
+		return nil, fmt.Errorf("7z executable filters require LZMA or LZMA2, not %q", method)
+	}
+	model := lzmaModelForFilter(filter)
 	packed := &countWriter{w: dst}
 	compressed := &countWriter{w: packed}
 	var encryption *aesWriter
@@ -202,16 +265,6 @@ func newStreamEncoder(dst io.Writer, folder *writerFolder, password, method stri
 		compressionTarget = compressed
 		folder.aesProperties = append([]byte(nil), encryption.properties...)
 	}
-	if method == "" {
-		if level == 0 {
-			method = "copy"
-		} else {
-			method = "lzma2"
-		}
-	}
-	if method == "store" {
-		method = "copy"
-	}
 	var encoder io.WriteCloser
 	switch method {
 	case "copy":
@@ -219,11 +272,18 @@ func newStreamEncoder(dst io.Writer, folder *writerFolder, password, method stri
 		folder.method = append([]byte(nil), methodCopy...)
 	case "lzma":
 		properties := make([]byte, 5)
-		properties[0] = (lzma.Properties{LC: 3, LP: 0, PB: 2}).Code()
-		binary.LittleEndian.PutUint32(properties[1:], uint32(dictionarySize))
-		raw := &skipWriter{w: compressionTarget, remaining: lzma.HeaderLen}
 		var err error
-		encoder, err = (lzma.WriterConfig{DictCap: dictionarySize}).NewWriter(raw)
+		if lzmaenc.Available() {
+			encoder, properties, err = lzmaenc.NewLZMA(
+				compressionTarget,
+				nativeEncoderConfigFor(level, model, expectedSize, expectedSizeDefined),
+			)
+		} else {
+			properties[0] = model.Code()
+			binary.LittleEndian.PutUint32(properties[1:], uint32(dictionarySize))
+			raw := &skipWriter{w: compressionTarget, remaining: lzma.HeaderLen}
+			encoder, err = (lzma.WriterConfig{DictCap: dictionarySize, Properties: &model}).NewWriter(raw)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -231,18 +291,35 @@ func newStreamEncoder(dst io.Writer, folder *writerFolder, password, method stri
 		folder.properties = properties
 	case "lzma2":
 		var err error
-		if level > 0 && level <= 2 {
+		if lzmaenc.Available() {
+			var properties []byte
+			encoder, properties, err = lzmaenc.NewLZMA2(
+				compressionTarget,
+				nativeEncoderConfigFor(level, model, expectedSize, expectedSizeDefined),
+			)
+			folder.properties = properties
+		} else if level > 0 && level <= 2 && filter == sevenzip.BranchFilterNone {
 			encoder, err = newFastLZMA2Writer(compressionTarget, dictionarySize)
 		} else {
-			encoder, err = (lzma.Writer2Config{DictCap: dictionarySize}).NewWriter2(compressionTarget)
+			encoder, err = (lzma.Writer2Config{DictCap: dictionarySize, Properties: &model}).NewWriter2(compressionTarget)
 		}
 		if err != nil {
 			return nil, err
 		}
 		folder.method = append([]byte(nil), methodLZMA2...)
-		folder.properties = []byte{lzma.EncodeDictCap(int64(dictionarySize))}
+		if len(folder.properties) == 0 {
+			folder.properties = []byte{lzma.EncodeDictCap(int64(dictionarySize))}
+		}
 	default:
 		return nil, fmt.Errorf("unsupported 7z compression method %q", method)
+	}
+	if filter != sevenzip.BranchFilterNone {
+		filtered, err := sevenzip.NewBranchFilterWriter(encoder, filter)
+		if err != nil {
+			return nil, errors.Join(err, encoder.Close())
+		}
+		encoder = filtered
+		folder.filterMethod = branchFilterMethod(filter)
 	}
 	return &streamEncoder{
 		folder:     folder,
@@ -251,6 +328,91 @@ func newStreamEncoder(dst io.Writer, folder *writerFolder, password, method stri
 		packed:     packed,
 		compressed: compressed,
 	}, nil
+}
+
+func nativeEncoderConfig(level int) lzmaenc.Config {
+	return nativeEncoderConfigFor(
+		level,
+		lzma.Properties{LC: 3, LP: 0, PB: 2},
+		0,
+		false,
+	)
+}
+
+func nativeEncoderConfigFor(
+	level int,
+	properties lzma.Properties,
+	expectedSize uint64,
+	expectedSizeDefined bool,
+) lzmaenc.Config {
+	dictionary := nativeDictionaryForLevel(level)
+	if level < 0 {
+		dictionary = dictionaryForLevel(level)
+		level = 5
+	}
+	threads := 1
+	if runtime.GOMAXPROCS(0) > 1 {
+		threads = 2
+	}
+	return lzmaenc.Config{
+		Level:               level,
+		Dictionary:          uint32(dictionary),
+		Threads:             threads,
+		MaxMemory:           maxNativeEncoderMemory,
+		LC:                  properties.LC,
+		LP:                  properties.LP,
+		PB:                  properties.PB,
+		PropertiesDefined:   true,
+		ExpectedSize:        expectedSize,
+		ExpectedSizeDefined: expectedSizeDefined,
+	}
+}
+
+func lzmaModelForFilter(filter sevenzip.BranchFilter) lzma.Properties {
+	switch filter {
+	case sevenzip.BranchFilterARM64:
+		return lzma.Properties{LC: 1, LP: 2, PB: 2}
+	case sevenzip.BranchFilterIA64:
+		return lzma.Properties{LC: 0, LP: 4, PB: 4}
+	default:
+		return lzma.Properties{LC: 3, LP: 0, PB: 2}
+	}
+}
+
+func branchFilterMethod(filter sevenzip.BranchFilter) []byte {
+	switch filter {
+	case sevenzip.BranchFilterARM64:
+		return append([]byte(nil), methodARM64...)
+	case sevenzip.BranchFilterBCJ:
+		return append([]byte(nil), methodBCJ...)
+	case sevenzip.BranchFilterIA64:
+		return append([]byte(nil), methodIA64...)
+	default:
+		return nil
+	}
+}
+
+func nativeDictionaryForLevel(level int) int {
+	switch {
+	case level <= 0:
+		return 64 << 10
+	case level == 1:
+		return 256 << 10
+	case level == 2:
+		return 1 << 20
+	case level == 3:
+		return 4 << 20
+	case level == 4:
+		return 16 << 20
+	case level == 5:
+		return 32 << 20
+	case level == 6:
+		return 64 << 20
+	case level == 7:
+		return 128 << 20
+	default:
+		return 256 << 20
+	}
 }
 
 type nopWriteCloser struct{ io.Writer }
@@ -309,18 +471,14 @@ func (w *streamEncoder) Close() error {
 		return nil
 	}
 	w.closed = true
-	if err := w.lzma.Close(); err != nil {
-		return err
-	}
+	err := w.lzma.Close()
 	if w.encryption != nil {
-		if err := w.encryption.Close(); err != nil {
-			return err
-		}
+		err = errors.Join(err, w.encryption.Close())
 	}
 	w.folder.packSize = w.packed.n
 	w.folder.compressedSize = w.compressed.n
 	w.folder.uncompressedSize = w.size
-	return nil
+	return err
 }
 
 func (w *fileWriter) Write(p []byte) (int, error) {
@@ -394,8 +552,41 @@ func (w *archiveWriter) Close() error {
 			packed.n,
 			uint64(len(header)),
 			crc32.ChecksumIEEE(header),
+			method7zAES,
 			encryption.properties,
 		)
+	} else {
+		packPosition, seekErr := w.w.Seek(0, io.SeekCurrent)
+		if seekErr != nil {
+			return seekErr
+		}
+		var packed bytes.Buffer
+		compressor, compressErr := flate.NewWriter(&packed, flate.DefaultCompression)
+		if compressErr != nil {
+			return compressErr
+		}
+		if _, compressErr = compressor.Write(header); compressErr == nil {
+			compressErr = compressor.Close()
+		} else {
+			_ = compressor.Close()
+		}
+		if compressErr != nil {
+			return compressErr
+		}
+		encoded := encodedHeader(
+			uint64(packPosition-32),
+			uint64(packed.Len()),
+			uint64(len(header)),
+			crc32.ChecksumIEEE(header),
+			methodDeflate,
+			nil,
+		)
+		if packed.Len()+len(encoded) < len(header) {
+			if _, err := w.w.Write(packed.Bytes()); err != nil {
+				return err
+			}
+			header = encoded
+		}
 	}
 	headerOffset, err := w.w.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -423,7 +614,7 @@ func (w *archiveWriter) Close() error {
 	return err
 }
 
-func encodedHeader(packPosition, packSize, unpackSize uint64, checksum uint32, properties []byte) []byte {
+func encodedHeader(packPosition, packSize, unpackSize uint64, checksum uint32, method, properties []byte) []byte {
 	var out bytes.Buffer
 	out.WriteByte(idEncodedHeader)
 	out.WriteByte(idPackInfo)
@@ -438,7 +629,7 @@ func encodedHeader(packPosition, packSize, unpackSize uint64, checksum uint32, p
 	writeUint64(&out, 1)
 	out.WriteByte(0)
 	writeUint64(&out, 1)
-	writeCoder(&out, method7zAES, properties)
+	writeCoder(&out, method, properties)
 	out.WriteByte(idCodersUnpackSize)
 	writeUint64(&out, unpackSize)
 	out.WriteByte(idCRC)
@@ -500,6 +691,9 @@ func writeStreamsInfo(out *bytes.Buffer, folders []*writerFolder) {
 			writeUint64(out, folder.compressedSize)
 		}
 		writeUint64(out, folder.uncompressedSize)
+		if len(folder.filterMethod) > 0 {
+			writeUint64(out, folder.uncompressedSize)
+		}
 	}
 	out.WriteByte(idCRC)
 	out.WriteByte(1)
@@ -542,16 +736,39 @@ func writeStreamsInfo(out *bytes.Buffer, folders []*writerFolder) {
 }
 
 func writeFolder(out *bytes.Buffer, folder *writerFolder) {
-	if len(folder.aesProperties) == 0 {
+	encrypted := len(folder.aesProperties) > 0
+	filtered := len(folder.filterMethod) > 0
+	if !encrypted && !filtered {
 		writeUint64(out, 1)
 		writeCoder(out, folder.method, folder.properties)
 		return
 	}
-	writeUint64(out, 2)
-	writeCoder(out, method7zAES, folder.aesProperties)
+	coderCount := uint64(2)
+	if encrypted && filtered {
+		coderCount = 3
+	}
+	writeUint64(out, coderCount)
+	if encrypted {
+		writeCoder(out, method7zAES, folder.aesProperties)
+	}
 	writeCoder(out, folder.method, folder.properties)
-	writeUint64(out, 1) // Compression input stream
-	writeUint64(out, 0) // AES output stream
+	if filtered {
+		writeCoder(out, folder.filterMethod, nil)
+	}
+	if encrypted {
+		writeUint64(out, 1) // Compression input stream
+		writeUint64(out, 0) // AES output stream
+	}
+	if filtered {
+		filterInput := uint64(1)
+		compressionOutput := uint64(0)
+		if encrypted {
+			filterInput = 2
+			compressionOutput = 1
+		}
+		writeUint64(out, filterInput)
+		writeUint64(out, compressionOutput)
+	}
 }
 
 func writeCoder(out *bytes.Buffer, method, properties []byte) {

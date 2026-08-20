@@ -16,6 +16,73 @@ type Root struct {
 	name string
 }
 
+// ParentCache keeps one extraction directory pinned between consecutive files.
+// When revalidation is enabled, Directory checks the handle identity before
+// every reuse. Returned roots are borrowed and must not be closed by the caller.
+type ParentCache struct {
+	base       *Root
+	revalidate bool
+	path       string
+	directory  *Root
+	identity   fs.FileInfo
+}
+
+func NewParentCache(base *Root, revalidate bool) *ParentCache {
+	return &ParentCache{base: base, revalidate: revalidate}
+}
+
+func (c *ParentCache) Directory(name string, perm fs.FileMode) (*Root, error) {
+	clean := filepath.Clean(name)
+	if c.directory != nil && clean == c.path {
+		if !c.revalidate {
+			return c.directory, nil
+		}
+		current, err := c.base.Lstat(clean)
+		if err == nil && current.Mode()&os.ModeSymlink == 0 && current.IsDir() && os.SameFile(current, c.identity) {
+			return c.directory, nil
+		}
+		if closeErr := c.closeDirectory(); closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	if c.directory != nil {
+		if err := c.closeDirectory(); err != nil {
+			return nil, err
+		}
+	}
+	directory, err := c.base.MkdirRoot(clean, perm)
+	if err != nil {
+		return nil, err
+	}
+	var identity fs.FileInfo
+	if c.revalidate {
+		identity, err = directory.Lstat(".")
+		if err != nil {
+			directory.Close()
+			return nil, err
+		}
+	}
+	c.path = clean
+	c.directory = directory
+	c.identity = identity
+	return directory, nil
+}
+
+func (c *ParentCache) Close() error {
+	return c.closeDirectory()
+}
+
+func (c *ParentCache) closeDirectory() error {
+	if c.directory == nil {
+		return nil
+	}
+	directory := c.directory
+	c.path = ""
+	c.directory = nil
+	c.identity = nil
+	return directory.Close()
+}
+
 func OpenExistingRoot(name string) (*Root, error) {
 	return openRoot(name, false, true)
 }

@@ -183,13 +183,18 @@ func readSizes(r io.ByteReader, count uint64) ([]uint64, error) {
 }
 
 func readCRC(r util.Reader, count uint64) ([]uint32, error) {
+	crcs, _, err := readCRCDefined(r, count)
+	return crcs, err
+}
+
+func readCRCDefined(r util.Reader, count uint64) ([]uint32, []bool, error) {
 	if err := checkUint64(count, true); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	defined, err := readOptionalBool(r, count)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	crcs := make([]uint32, count)
@@ -197,12 +202,12 @@ func readCRC(r util.Reader, count uint64) ([]uint32, error) {
 	for i := range defined {
 		if defined[i] {
 			if err := binary.Read(r, binary.LittleEndian, &crcs[i]); err != nil {
-				return nil, fmt.Errorf("readCRC: Read error: %w", err)
+				return nil, nil, fmt.Errorf("readCRC: Read error: %w", err)
 			}
 		}
 	}
 
-	return crcs, nil
+	return crcs, defined, nil
 }
 
 //nolint:cyclop
@@ -477,7 +482,7 @@ func readUnpackInfo(r util.Reader) (*unpackInfo, error) {
 	}
 
 	if id == idCRC {
-		if u.digest, err = readCRC(r, folders); err != nil {
+		if u.digest, u.digestDefined, err = readCRCDefined(r, folders); err != nil {
 			return nil, err
 		}
 
@@ -495,8 +500,9 @@ func readUnpackInfo(r util.Reader) (*unpackInfo, error) {
 }
 
 //nolint:cyclop,funlen,gocognit
-func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error) {
+func readSubStreamsInfo(r util.Reader, unpack *unpackInfo) (*subStreamsInfo, error) {
 	s := new(subStreamsInfo)
+	folder := unpack.folder
 
 	id, err := r.ReadByte()
 	if err != nil {
@@ -574,8 +580,39 @@ func readSubStreamsInfo(r util.Reader, folder []*folder) (*subStreamsInfo, error
 	}
 
 	if id == idCRC {
-		if s.digest, err = readCRC(r, files); err != nil {
-			return nil, err
+		unknown := uint64(0)
+		for i, streams := range s.streams {
+			if streams == 1 && i < len(unpack.digestDefined) && unpack.digestDefined[i] {
+				continue
+			}
+			if unknown > security.MaxArchiveEntries-streams {
+				return nil, errors.New("sevenzip: too many substream checksums")
+			}
+			unknown += streams
+		}
+		unknownDigest, unknownDefined, readErr := readCRCDefined(r, unknown)
+		if readErr != nil {
+			return nil, readErr
+		}
+		s.digest = make([]uint32, files)
+		s.digestDefined = make([]bool, files)
+		fileIndex, digestIndex := 0, 0
+		for i, streams := range s.streams {
+			if streams == 1 && i < len(unpack.digestDefined) && unpack.digestDefined[i] {
+				s.digest[fileIndex] = unpack.digest[i]
+				s.digestDefined[fileIndex] = true
+				fileIndex++
+				continue
+			}
+			for range streams {
+				s.digest[fileIndex] = unknownDigest[digestIndex]
+				s.digestDefined[fileIndex] = unknownDefined[digestIndex]
+				fileIndex++
+				digestIndex++
+			}
+		}
+		if digestIndex != len(unknownDigest) || fileIndex != len(s.digest) {
+			return nil, errors.New("sevenzip: substream checksum count does not match")
 		}
 
 		id, err = r.ReadByte()
@@ -626,7 +663,7 @@ func readStreamsInfo(r util.Reader) (*streamsInfo, error) {
 			return nil, errMissingUnpackInfo
 		}
 
-		if s.subStreamsInfo, err = readSubStreamsInfo(r, s.unpackInfo.folder); err != nil {
+		if s.subStreamsInfo, err = readSubStreamsInfo(r, s.unpackInfo); err != nil {
 			return nil, err
 		}
 

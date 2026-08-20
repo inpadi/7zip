@@ -69,7 +69,9 @@ if errorlevel 1 goto :failed
 
 call :build windows 386 .exe
 if errorlevel 1 goto :failed
-call :build windows amd64 .exe
+call :build windows amd64 .exe native
+if errorlevel 1 goto :failed
+call :build windows amd64 -portable.exe portable
 if errorlevel 1 goto :failed
 call :build windows arm64 .exe
 if errorlevel 1 goto :failed
@@ -91,6 +93,16 @@ exit /b 0
 set "GOOS=%~1"
 set "GOARCH=%~2"
 set "Output=Out\%GOOS%\%GOARCH%\%OutName%%~3"
+set "CGO_ENABLED=0"
+
+if /I "%~4"=="native" (
+  where gcc >nul 2>nul
+  if errorlevel 1 (
+    echo ERROR: GCC is required for the accelerated Windows AMD64 artifact.
+    exit /b 1
+  )
+  set "CGO_ENABLED=1"
+)
 
 if not exist "Out\%GOOS%\%GOARCH%" mkdir "Out\%GOOS%\%GOARCH%"
 if errorlevel 1 exit /b 1
@@ -98,6 +110,19 @@ if errorlevel 1 exit /b 1
 echo Building %GOOS%/%GOARCH%: %Output%
 go build %BuildArgs% -trimpath -o "%Output%" ./cmd/7zip
 if errorlevel 1 exit /b 1
+
+if /I "%~4"=="native" (
+  go tool nm "%Output%" | findstr /C:"LzmaDec_DecodeReal_3" >nul
+  if errorlevel 1 (
+    echo ERROR: Accelerated artifact is missing the x64 LZMA decoder.
+    exit /b 1
+  )
+  go tool nm "%Output%" | findstr /C:"i7z_lzma_encoder_create" >nul
+  if errorlevel 1 (
+    echo ERROR: Accelerated artifact is missing the native LZMA encoder.
+    exit /b 1
+  )
+)
 
 if /I "%GOOS%"=="windows" call :sign "%Output%"
 if errorlevel 1 exit /b 1

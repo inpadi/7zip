@@ -42,11 +42,17 @@ jobs:
           go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -exclude=G104,G115 ./...
       - name: Install pinned SBOM generator
         run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
-      - name: Build binaries and SBOMs
+      - name: Install Windows AMD64 cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 zip
+      - name: Build release packages and SBOMs
         shell: bash
         run: |
           set -euo pipefail
           mkdir artifacts
+          compiled_modules="$RUNNER_TEMP/i7z-compiled-modules.txt"
+          : > "$compiled_modules"
           targets=(linux/386 linux/amd64 linux/arm linux/arm64 windows/386 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64)
           for target in "${targets[@]}"; do
             os=${target%/*}
@@ -54,9 +60,93 @@ jobs:
             suffix=""
             if [[ "$os" == windows ]]; then suffix=".exe"; fi
             artifact="artifacts/i7z-${os}-${arch}${suffix}"
+            if [[ "$target" == windows/amd64 ]]; then
+              CC=x86_64-w64-mingw32-gcc CGO_ENABLED=1 GOOS="$os" GOARCH="$arch" \
+                go build -buildvcs=true -trimpath -o "$artifact" ./cmd/7zip
+              CC=x86_64-w64-mingw32-gcc CGO_ENABLED=1 GOOS="$os" GOARCH="$arch" \
+                cyclonedx-gomod app -json -packages -licenses \
+                -main cmd/7zip -output "${artifact}.cdx.json" .
+              CC=x86_64-w64-mingw32-gcc CGO_ENABLED=1 GOOS="$os" GOARCH="$arch" \
+                go list -deps \
+                  -f '{{with .Module}}{{if not .Main}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}' \
+                  ./cmd/7zip >> "$compiled_modules"
+              go tool nm "$artifact" > "$RUNNER_TEMP/i7z-windows-amd64.nm"
+              grep -q 'LzmaDec_DecodeReal_3' "$RUNNER_TEMP/i7z-windows-amd64.nm"
+              grep -q 'i7z_lzma_encoder_create' "$RUNNER_TEMP/i7z-windows-amd64.nm"
+
+              portable="artifacts/i7z-windows-amd64-portable.exe"
+              GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+                go build -buildvcs=true -trimpath -o "$portable" ./cmd/7zip
+              GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+                cyclonedx-gomod app -json -packages -licenses \
+                -main cmd/7zip -output "${portable}.cdx.json" .
+              GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+                go list -deps \
+                  -f '{{with .Module}}{{if not .Main}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}' \
+                  ./cmd/7zip >> "$compiled_modules"
+              continue
+            fi
             GOOS="$os" GOARCH="$arch" go build -buildvcs=true -trimpath -o "$artifact" ./cmd/7zip
             GOOS="$os" GOARCH="$arch" cyclonedx-gomod app -json -packages -licenses \
               -main cmd/7zip -output "${artifact}.cdx.json" .
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go list -deps \
+                -f '{{with .Module}}{{if not .Main}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}' \
+                ./cmd/7zip >> "$compiled_modules"
+          done
+          license_files=(
+            LICENSE COPYRIGHT.md go.mod go.sum
+            DOC/License.txt DOC/copying.txt DOC/unRarLicense.txt
+            internal/native/sdk7z/README.md
+            internal/sevenzip/LICENSE internal/sevenzip/ORIGIN.md
+            internal/vdisk/LICENSE internal/vdisk/ORIGIN.md
+            internal/wim/LICENSE internal/wim/ORIGIN.md
+            internal/wim/xpress/LICENSE internal/wim/xpress/ORIGIN.md
+            internal/xz/LICENSE internal/xz/README.md
+            third_party/pbzip2/LICENSE third_party/pbzip2/GO-LICENSE
+            third_party/pbzip2/GO-PATENTS third_party/pbzip2/ORIGIN.md
+          )
+          package_root="$RUNNER_TEMP/i7z-packages"
+          module_license_root="$package_root/module-licenses"
+          mkdir -p "$package_root"
+          mkdir -p "$module_license_root/modules"
+          printf 'module\tversion\n' > "$module_license_root/MODULES.tsv"
+          while IFS='|' read -r module version directory; do
+            [[ -z "$module" ]] && continue
+            destination="$module_license_root/modules/${module}@${version:-unknown}"
+            mkdir -p "$destination"
+            mapfile -d '' notices < <(
+              find "$directory" -maxdepth 1 -type f \
+                \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' -o -iname 'PATENTS*' \) \
+                -print0
+            )
+            if [[ ${#notices[@]} -eq 0 ]]; then
+              echo "No license or notice file found for $module $version" >&2
+              exit 1
+            fi
+            for notice in "${notices[@]}"; do
+              cp "$notice" "$destination/$(basename "$notice")"
+            done
+            printf '%s\t%s\n' "$module" "$version" >> "$module_license_root/MODULES.tsv"
+          done < <(sort -u "$compiled_modules")
+          for artifact in artifacts/i7z-*; do
+            [[ "$artifact" == *.cdx.json ]] && continue
+            base=$(basename "$artifact")
+            stem=${base%.exe}
+            stage="$package_root/$stem"
+            mkdir -p "$stage"
+            binary_name=i7z
+            if [[ "$base" == *.exe ]]; then binary_name=i7z.exe; fi
+            cp "$artifact" "$stage/$binary_name"
+            cp "${artifact}.cdx.json" "$stage/i7z.cdx.json"
+            cp --parents "${license_files[@]}" "$stage"
+            cp -R "$module_license_root" "$stage/module-licenses"
+            if [[ "$base" == *.exe ]]; then
+              (cd "$package_root" && zip -qr "$GITHUB_WORKSPACE/artifacts/${stem}.zip" "$stem")
+            else
+              tar -C "$package_root" -czf "artifacts/${stem}.tar.gz" "$stem"
+            fi
+            rm -f "$artifact" "${artifact}.cdx.json"
           done
           (cd artifacts && sha256sum i7z-* > SHA256SUMS)
       - name: Attest release artifacts

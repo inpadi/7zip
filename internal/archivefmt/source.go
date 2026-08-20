@@ -24,24 +24,19 @@ type sourceFile struct {
 }
 
 func (s sourceFile) open() (*os.File, error) {
-	before, err := s.root.Lstat(s.relative)
-	if err != nil {
-		return nil, err
-	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || !os.SameFile(s.info, before) {
-		return nil, fmt.Errorf("input %q changed after it was enumerated", s.path)
-	}
+	// Root.Open contains any link resolution; the descriptor identity check
+	// prevents a post-enumeration path change from redirecting the input.
 	file, err := s.root.Open(s.relative)
 	if err != nil {
 		return nil, err
 	}
 	after, err := file.Stat()
-	if err != nil || !os.SameFile(before, after) {
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(s.info, after) {
 		file.Close()
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("input %q changed while it was opened", s.path)
+		return nil, fmt.Errorf("input %q changed after it was enumerated", s.path)
 	}
 	return file, nil
 }

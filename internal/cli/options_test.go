@@ -72,6 +72,40 @@ func TestParseStreamsAndCompression(t *testing.T) {
 	}
 }
 
+func TestParseExtractionPublication(t *testing.T) {
+	opts, err := Parse([]string{"x", "-mep=atomic", "archive.7z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Publication != PublicationAtomic || !opts.PublicationDefined {
+		t.Fatalf("unexpected publication options: %#v", opts)
+	}
+
+	if _, err := Parse([]string{"a", "-mep=direct", "archive.7z", "input"}); err == nil {
+		t.Fatal("creation unexpectedly accepted an extraction publication mode")
+	}
+	if _, err := Parse([]string{"x", "-mep=unknown", "archive.7z"}); err == nil {
+		t.Fatal("extract unexpectedly accepted an unknown publication mode")
+	}
+}
+
+func TestParseExecutableFilters(t *testing.T) {
+	opts, err := Parse([]string{"a", "-mf=off", "archive.7z", "input"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.DisableFilters || !opts.FiltersDefined {
+		t.Fatalf("unexpected executable filter options: %#v", opts)
+	}
+
+	if _, err := Parse([]string{"x", "-mf=off", "archive.7z"}); err == nil {
+		t.Fatal("extraction unexpectedly accepted an executable filter mode")
+	}
+	if _, err := Parse([]string{"a", "-mf=unknown", "archive.7z", "input"}); err == nil {
+		t.Fatal("creation unexpectedly accepted an unknown executable filter mode")
+	}
+}
+
 func TestParseListFiles(t *testing.T) {
 	root := t.TempDir()
 	utf8List := filepath.Join(root, "utf8.lst")

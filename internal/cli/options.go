@@ -34,6 +34,14 @@ const (
 	OverwriteSkip
 )
 
+// ExtractionPublication controls how newly extracted files become visible.
+type ExtractionPublication uint8
+
+const (
+	PublicationDirect ExtractionPublication = iota
+	PublicationAtomic
+)
+
 // Options is the supported command-line surface.
 type Options struct {
 	Command                 Command
@@ -42,12 +50,16 @@ type Options struct {
 	OutputDir               string
 	Password                string
 	Overwrite               OverwriteMode
+	Publication             ExtractionPublication
+	PublicationDefined      bool
 	Technical               bool
 	Bare                    bool
 	Solid                   bool
 	SolidDefined            bool
 	HeaderEncryption        bool
 	HeaderEncryptionDefined bool
+	DisableFilters          bool
+	FiltersDefined          bool
 	Format                  string
 	Stdin                   bool
 	StdinName               string
@@ -145,6 +157,12 @@ func Parse(args []string) (Options, error) {
 	if opts.HeaderEncryptionDefined && opts.Command != CommandAdd && opts.Command != CommandUpdate {
 		return Options{}, errors.New("-mhe is only supported for archive creation and updates")
 	}
+	if opts.FiltersDefined && opts.Command != CommandAdd && opts.Command != CommandUpdate {
+		return Options{}, errors.New("-mf is only supported for archive creation and updates")
+	}
+	if opts.PublicationDefined && opts.Command != CommandExtract && opts.Command != CommandExtractFlat {
+		return Options{}, errors.New("-mep is only supported for extract commands")
+	}
 	if opts.HeaderEncryption && opts.Password == "" {
 		return Options{}, errors.New("-mhe=on requires -p{password}")
 	}
@@ -238,6 +256,28 @@ func parseSwitch(opts *Options, arg string) error {
 		default:
 			return fmt.Errorf("unsupported compression method %q", arg[4:])
 		}
+	case strings.HasPrefix(s, "mep="):
+		value := strings.TrimPrefix(s, "mep=")
+		switch value {
+		case "direct":
+			opts.Publication = PublicationDirect
+		case "atomic":
+			opts.Publication = PublicationAtomic
+		default:
+			return fmt.Errorf("unsupported extraction publication mode %q; use direct or atomic", value)
+		}
+		opts.PublicationDefined = true
+	case strings.HasPrefix(s, "mf="):
+		value := strings.TrimPrefix(s, "mf=")
+		switch value {
+		case "on":
+			opts.DisableFilters = false
+		case "off":
+			opts.DisableFilters = true
+		default:
+			return fmt.Errorf("unsupported executable filter mode %q; use -mf=on or -mf=off", value)
+		}
+		opts.FiltersDefined = true
 	case s == "slt":
 		opts.Technical = true
 	case strings.HasPrefix(s, "ms="):

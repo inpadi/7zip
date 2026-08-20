@@ -141,6 +141,7 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 	}
 	defer input.Close()
 	var root *security.Root
+	var parents *security.ParentCache
 	seen := make(map[string]string)
 	if extract != nil {
 		root, err = extractionRoot(extract.OutputDir)
@@ -148,6 +149,8 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 			return Result{}, err
 		}
 		defer root.Close()
+		parents = extractionParents(root, *extract)
+		defer parents.Close()
 	}
 	var result Result
 	var budget security.Budget
@@ -174,7 +177,7 @@ func processWIM(archive string, patterns []string, dst io.Writer, extract *Extra
 			stream = reader
 		}
 		if extract != nil {
-			n, wrote, extractErr := extractEntry(root, item.entry.Name, item.entry.Mode, item.entry.Size, stream, *extract, seen, &budget)
+			n, wrote, extractErr := extractEntry(parents, item.entry.Name, item.entry.Mode, item.entry.Size, stream, *extract, seen, &budget)
 			if reader != nil {
 				closeErr := reader.Close()
 				if extractErr == nil {

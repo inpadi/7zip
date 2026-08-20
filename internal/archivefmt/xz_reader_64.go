@@ -7,7 +7,7 @@ import (
 	"io"
 
 	"github.com/inpadi/7zip/internal/security"
-	"github.com/ulikunitz/xz"
+	"github.com/inpadi/7zip/internal/xz"
 )
 
 const xzInputBufferSize = 64 * 1024
@@ -17,5 +17,5 @@ func newXZReader(input io.Reader) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return io.NopCloser(reader), nil
+	return reader, nil
 }

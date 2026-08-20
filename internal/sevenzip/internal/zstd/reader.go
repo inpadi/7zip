@@ -26,16 +26,22 @@ var (
 )
 
 func (rc *readCloser) Close() error {
-	if rc.c == nil {
+	if rc.c == nil || rc.r == nil {
 		return errAlreadyClosed
 	}
 
-	if err := rc.c.Close(); err != nil {
+	closer, decoder := rc.c, rc.r
+	rc.c, rc.r = nil, nil
+	closeErr := closer.Close()
+	resetErr := decoder.Reset(nil)
+	if resetErr != nil {
+		decoder.Close()
+	} else {
+		zstdReaderPool.Put(decoder)
+	}
+	if err := errors.Join(closeErr, resetErr); err != nil {
 		return fmt.Errorf("zstd: error closing: %w", err)
 	}
-
-	zstdReaderPool.Put(rc.r)
-	rc.c, rc.r = nil, nil
 
 	return nil
 }
@@ -68,10 +74,9 @@ func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 		}
 	} else {
 		if r, err = zstd.NewReader(readers[0],
-			zstd.WithDecoderConcurrency(1),
 			zstd.WithDecoderMaxMemory(security.MaxDecoderMemory),
 			zstd.WithDecoderMaxWindow(security.MaxDecoderMemory),
-			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderLowmem(false),
 		); err != nil {
 			return nil, fmt.Errorf("zstd: error creating reader: %w", err)
 		}

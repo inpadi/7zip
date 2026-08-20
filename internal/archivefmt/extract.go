@@ -12,7 +12,7 @@ import (
 	"github.com/inpadi/7zip/internal/security"
 )
 
-func extractEntry(root *security.Root, name string, mode fs.FileMode, declared uint64, reader io.Reader, options ExtractOptions, seen map[string]string, budget *security.Budget) (int64, bool, error) {
+func extractEntry(parents *security.ParentCache, name string, mode fs.FileMode, declared uint64, reader io.Reader, options ExtractOptions, seen map[string]string, budget *security.Budget) (int64, bool, error) {
 	_, relative, err := archive7z.SafeDestination(".", name, options.Flatten)
 	if err != nil {
 		return 0, false, err
@@ -29,11 +29,8 @@ func extractEntry(root *security.Root, name string, mode fs.FileMode, declared u
 	}
 	seen[key] = name
 	if mode.IsDir() {
-		directory, err := root.MkdirRoot(relative, 0o755)
+		_, err := parents.Directory(relative, 0o755)
 		if err != nil {
-			return 0, false, err
-		}
-		if err := directory.Close(); err != nil {
 			return 0, false, err
 		}
 		return 0, false, nil
@@ -41,28 +38,43 @@ func extractEntry(root *security.Root, name string, mode fs.FileMode, declared u
 	if mode.Type() != 0 {
 		return 0, false, fmt.Errorf("refusing unsupported special entry %q (%s)", name, mode.Type())
 	}
-	parent, err := root.MkdirRoot(filepath.Dir(relative), 0o755)
+	parent, err := parents.Directory(filepath.Dir(relative), 0o755)
 	if err != nil {
 		return 0, false, err
 	}
-	defer parent.Close()
 	target := filepath.Base(relative)
-	existing, statErr := parent.Lstat(target)
-	if statErr == nil {
-		if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
-			return 0, false, fmt.Errorf("refusing to replace non-regular path %q", relative)
+	var existing fs.FileInfo
+	var statErr error
+	direct := false
+	var tempName string
+	var temp *os.File
+	if options.Publication == PublicationDirect {
+		tempName = target
+		temp, err = parent.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			direct = true
+		} else if !errors.Is(err, fs.ErrExist) {
+			return 0, false, err
 		}
-		switch options.Overwrite {
-		case OverwriteSkip:
-			return 0, false, nil
-		case OverwriteAll:
-		default:
-			return 0, false, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
-		}
-	} else if !errors.Is(statErr, fs.ErrNotExist) {
-		return 0, false, statErr
 	}
-	tempName, temp, err := parent.CreateTemp()
+	if !direct {
+		existing, statErr = parent.Lstat(target)
+		if statErr == nil {
+			if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() {
+				return 0, false, fmt.Errorf("refusing to replace non-regular path %q", relative)
+			}
+			switch options.Overwrite {
+			case OverwriteSkip:
+				return 0, false, nil
+			case OverwriteAll:
+			default:
+				return 0, false, fmt.Errorf("output file %q already exists; use -y, -aoa, or -aos", relative)
+			}
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			return 0, false, statErr
+		}
+		tempName, temp, err = parent.CreateTemp()
+	}
 	if err != nil {
 		return 0, false, err
 	}
@@ -77,21 +89,22 @@ func extractEntry(root *security.Root, name string, mode fs.FileMode, declared u
 	if err != nil {
 		return n, false, err
 	}
-	if err := temp.Chmod(security.SafeFileMode(mode)); err != nil {
+	if err := security.ApplySafeFileMode(temp, mode); err != nil {
 		return n, false, err
 	}
-	if err := temp.Sync(); err != nil {
-		return n, false, err
+	if !direct {
+		if err := temp.Sync(); err != nil {
+			return n, false, err
+		}
 	}
 	if err := temp.Close(); err != nil {
 		return n, false, err
 	}
+	if direct {
+		removeTemp = false
+		return n, true, nil
+	}
 	if options.Overwrite == OverwriteAll {
-		if statErr == nil {
-			if err := parent.Remove(target); err != nil {
-				return n, false, err
-			}
-		}
 		if err := parent.Rename(tempName, target); err != nil {
 			return n, false, err
 		}
@@ -115,4 +128,8 @@ func extractionRoot(output string) (*security.Root, error) {
 		output = "."
 	}
 	return security.OpenExtractionRoot(output)
+}
+
+func extractionParents(root *security.Root, options ExtractOptions) *security.ParentCache {
+	return security.NewParentCache(root, options.Publication == PublicationAtomic)
 }

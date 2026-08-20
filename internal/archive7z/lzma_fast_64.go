@@ -5,7 +5,7 @@ package archive7z
 import (
 	"io"
 
-	"github.com/ulikunitz/xz/lzma"
+	"github.com/inpadi/7zip/internal/xz/lzma"
 )
 
 // newFastLZMA2Writer uses the stable, bounded-memory LZMA2 writer.

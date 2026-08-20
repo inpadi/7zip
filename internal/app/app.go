@@ -253,6 +253,8 @@ func addOptions(opts cli.Options) archivefmt.AddOptions {
 		SolidDefined:     opts.SolidDefined,
 		Password:         opts.Password,
 		HeaderEncryption: opts.HeaderEncryption,
+		DisableFilters:   opts.DisableFilters,
+		FiltersDefined:   opts.FiltersDefined,
 		Level:            opts.CompressionLevel,
 		LevelDefined:     opts.CompressionLevelDefined,
 		Method:           opts.Method,
@@ -368,18 +370,26 @@ func runTest(opts cli.Options, stdout, stderr io.Writer) int {
 func runExtract(opts cli.Options, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Extracting archive: %s\n\n", opts.Archive)
 	result, err := archivefmt.Extract(opts.Archive, archivefmt.ExtractOptions{
-		Format:    opts.Format,
-		OutputDir: opts.OutputDir,
-		Patterns:  selectionPatterns(opts),
-		Password:  opts.Password,
-		Flatten:   opts.Command == cli.CommandExtractFlat,
-		Overwrite: overwritePolicy(opts.Overwrite),
+		Format:      opts.Format,
+		OutputDir:   opts.OutputDir,
+		Patterns:    selectionPatterns(opts),
+		Password:    opts.Password,
+		Flatten:     opts.Command == cli.CommandExtractFlat,
+		Overwrite:   overwritePolicy(opts.Overwrite),
+		Publication: publicationMode(opts.Publication),
 	})
 	if err != nil {
 		return operationError(stderr, err)
 	}
 	fmt.Fprintf(stdout, "Files: %d\nSize: %d\n\nEverything is Ok\n", result.Files, result.Bytes)
 	return ExitSuccess
+}
+
+func publicationMode(mode cli.ExtractionPublication) archivefmt.PublicationMode {
+	if mode == cli.PublicationAtomic {
+		return archivefmt.PublicationAtomic
+	}
+	return archivefmt.PublicationDirect
 }
 
 func selectionPatterns(opts cli.Options) []string {
@@ -474,6 +484,8 @@ func printUsage(w io.Writer) {
   -o{dir}    : Set output directory
   -mhe=on|off: Encrypt or expose 7z archive headers
   -m0={name} : Set compression method
+  -mf=on|off : Enable or disable executable branch filters
+  -mep={mode}: Publish new extracted files directly (default) or atomically
   -mx[=0-9]  : Set compression level
   -ms=on|off : Enable or disable solid 7z blocks
   -p{value}  : Set creation or extraction password

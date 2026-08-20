@@ -1,7 +1,6 @@
 package archivefmt
 
 import (
-	"compress/bzip2"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -9,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	dsnetbzip2 "github.com/dsnet/compress/bzip2"
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/bzip2reader"
 	"github.com/inpadi/7zip/internal/security"
+	"github.com/inpadi/7zip/internal/xz"
 	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
 )
 
 func isSingleStream(format Format) bool {
@@ -63,17 +62,13 @@ func addStream(archive string, sourceNames []string, format Format, level int, r
 		writer.ModTime = source.info.ModTime()
 		compressed = writer
 	case FormatBzip2:
-		config := &dsnetbzip2.WriterConfig{}
-		if level >= 0 {
-			config.Level = max(level, 1)
-		}
-		compressed, err = dsnetbzip2.NewWriter(temp, config)
+		compressed, err = newBzip2Writer(temp, bzip2BlockLevel(level))
 	case FormatXZ:
 		config := xz.WriterConfig{}
 		if level >= 0 {
 			config.DictCap = dictionaryForCompressionLevel(level)
 		}
-		compressed, err = config.NewWriter(temp)
+		compressed, err = newXZWriter(temp, config)
 	case FormatZstd:
 		var options []zstd.EOption
 		if level >= 0 {
@@ -133,6 +128,20 @@ func dictionaryForCompressionLevel(level int) int {
 	}
 }
 
+func bzip2BlockLevel(level int) int {
+	if level < 0 {
+		level = 5
+	}
+	switch {
+	case level <= 1:
+		return 1
+	case level < 5:
+		return level*2 - 1
+	default:
+		return 9
+	}
+}
+
 func zstdLevel(level int) int {
 	if level <= 0 {
 		return 1
@@ -182,7 +191,13 @@ func openStream(archive string, format Format) (*streamInput, error) {
 			return fileErr
 		}
 	case FormatBzip2:
-		input.reader = bzip2.NewReader(file)
+		reader, bzipErr := bzip2reader.NewReader(file)
+		if bzipErr != nil {
+			_ = file.Close()
+			return nil, bzipErr
+		}
+		input.reader = reader
+		input.close = reader.Close
 	case FormatXZ:
 		reader, xzErr := newXZReader(file)
 		if xzErr != nil {
@@ -200,10 +215,9 @@ func openStream(archive string, format Format) (*streamInput, error) {
 		}
 	case FormatZstd:
 		reader, zstdErr := zstd.NewReader(file,
-			zstd.WithDecoderConcurrency(1),
 			zstd.WithDecoderMaxMemory(security.MaxDecoderMemory),
 			zstd.WithDecoderMaxWindow(security.MaxDecoderMemory),
-			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderLowmem(false),
 		)
 		if zstdErr != nil {
 			_ = file.Close()
@@ -307,6 +321,8 @@ func extractStream(archive string, options ExtractOptions, format Format) (Resul
 		return Result{}, err
 	}
 	defer root.Close()
+	parents := extractionParents(root, options)
+	defer parents.Close()
 	input, err := openStream(archive, format)
 	if err != nil {
 		return Result{}, err
@@ -318,7 +334,7 @@ func extractStream(archive string, options ExtractOptions, format Format) (Resul
 	}
 	var budget security.Budget
 	budget.SetCompressedBytes(input.compressed)
-	n, wrote, err := extractEntry(root, input.name, 0o644, 0, input.reader, options, make(map[string]string), &budget)
+	n, wrote, err := extractEntry(parents, input.name, 0o644, 0, input.reader, options, make(map[string]string), &budget)
 	if err != nil {
 		return Result{}, err
 	}

@@ -2,6 +2,8 @@ package archive7z
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,6 +63,120 @@ func TestRoundTrip(t *testing.T) {
 	assertFileContent(t, filepath.Join(output, "input", "empty"), nil)
 }
 
+func TestNativeEncoderLevelMapping(t *testing.T) {
+	tests := []struct {
+		level      int
+		dictionary uint32
+	}{
+		{level: 0, dictionary: 64 << 10},
+		{level: 1, dictionary: 256 << 10},
+		{level: 2, dictionary: 1 << 20},
+		{level: 3, dictionary: 4 << 20},
+		{level: 4, dictionary: 16 << 20},
+		{level: 5, dictionary: 32 << 20},
+		{level: 6, dictionary: 64 << 20},
+		{level: 7, dictionary: 128 << 20},
+		{level: 8, dictionary: 256 << 20},
+		{level: 9, dictionary: 256 << 20},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("Level%d", test.level), func(t *testing.T) {
+			config := nativeEncoderConfig(test.level)
+			if config.Level != test.level {
+				t.Fatalf("level = %d, want %d", config.Level, test.level)
+			}
+			if config.Dictionary != test.dictionary {
+				t.Fatalf("dictionary = %d, want %d", config.Dictionary, test.dictionary)
+			}
+			if config.MaxMemory != maxNativeEncoderMemory {
+				t.Fatalf("memory limit = %d, want %d", config.MaxMemory, maxNativeEncoderMemory)
+			}
+		})
+	}
+
+	defaultConfig := nativeEncoderConfig(-1)
+	if defaultConfig.Level != 5 {
+		t.Fatalf("default level = %d, want 5", defaultConfig.Level)
+	}
+	if defaultConfig.Dictionary != uint32(dictionaryForLevel(-1)) {
+		t.Fatalf("default dictionary = %d, want %d", defaultConfig.Dictionary, dictionaryForLevel(-1))
+	}
+}
+
+func TestOrdinaryHeaderUsesEncodedStreamWhenSmaller(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "input")
+	for i := range 256 {
+		name := filepath.Join(input, fmt.Sprintf("driver-%03d.inf", i))
+		mustWriteFile(t, name, []byte("repeated driver metadata\n"))
+	}
+
+	archive := filepath.Join(root, "encoded-header.7z")
+	if _, err := AddWithOptions(archive, []string{input}, AddOptions{
+		Solid:        true,
+		Level:        0,
+		LevelDefined: true,
+		Method:       "copy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 32 {
+		t.Fatalf("archive is only %d bytes", len(data))
+	}
+	headerOffset := 32 + binary.LittleEndian.Uint64(data[12:20])
+	if headerOffset >= uint64(len(data)) {
+		t.Fatalf("next header offset %d is outside %d-byte archive", headerOffset, len(data))
+	}
+	if data[headerOffset] != idEncodedHeader {
+		t.Fatalf("next header ID = %#x, want encoded header %#x", data[headerOffset], idEncodedHeader)
+	}
+
+	entries, err := List(archive, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 257 {
+		t.Fatalf("entry count = %d, want 257", len(entries))
+	}
+	t.Run("Upstream7Zip", func(t *testing.T) {
+		upstream := findUpstream7z(t)
+		command := exec.Command(upstream, "t", "-bd", archive)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("upstream encoded-header test failed: %v\n%s", err, output)
+		}
+	})
+}
+
+func TestInputOpenRejectsReplacementAfterEnumeration(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "input.txt")
+	replacement := filepath.Join(root, "replacement.txt")
+	mustWriteFile(t, input, []byte("input"))
+	mustWriteFile(t, replacement, []byte("replacement"))
+	inputs, roots, err := collectInputs([]string{input}, filepath.Join(root, "archive.7z"), false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeInputRoots(roots)
+	if err := os.Remove(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(replacement, input); err != nil {
+		t.Fatal(err)
+	}
+	file, err := inputs[0].open()
+	if file != nil {
+		file.Close()
+	}
+	if err == nil {
+		t.Fatal("expected replaced input to be rejected")
+	}
+}
+
 func TestExtractOverwritePolicies(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "value.txt")
@@ -95,6 +211,37 @@ func TestExtractOverwritePolicies(t *testing.T) {
 		t.Fatalf("overwrite result = %#v", result)
 	}
 	assertFileContent(t, target, []byte("new"))
+}
+
+func TestDirectExtractRemovesCRCMismatch(t *testing.T) {
+	root := t.TempDir()
+	payload := []byte("unique direct extraction CRC payload 01-23-45-67-89")
+	source := filepath.Join(root, "payload.txt")
+	mustWriteFile(t, source, payload)
+	archive := filepath.Join(root, "payload.7z")
+	if _, err := AddWithOptions(archive, []string{source}, AddOptions{Method: "copy", Level: 0, LevelDefined: true}); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := bytes.Index(content, payload)
+	if offset < 0 {
+		t.Fatal("stored payload not found in archive")
+	}
+	content[offset] ^= 0xff
+	if err := os.WriteFile(archive, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output := filepath.Join(root, "output")
+	if _, err := Extract(archive, ExtractOptions{OutputDir: output, Publication: PublicationDirect}); err == nil {
+		t.Fatal("corrupted archive unexpectedly extracted")
+	}
+	if _, err := os.Stat(filepath.Join(output, "payload.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial direct output remains after CRC mismatch: %v", err)
+	}
 }
 
 func TestUpdateExistingArchive(t *testing.T) {

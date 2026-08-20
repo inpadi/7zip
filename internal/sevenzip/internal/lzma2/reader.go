@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/inpadi/7zip/internal/native/lzmadec"
 	"github.com/inpadi/7zip/internal/security"
-	"github.com/ulikunitz/xz/lzma"
+	"github.com/inpadi/7zip/internal/xz/lzma"
 )
 
 type readCloser struct {
@@ -50,7 +51,7 @@ func (rc *readCloser) Read(p []byte) (int, error) {
 }
 
 // NewReader returns a new LZMA2 io.ReadCloser.
-func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
+func NewReader(p []byte, unpackSize uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
 		return nil, errNeedOneReader
 	}
@@ -71,6 +72,18 @@ func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 
 	if err := config.Verify(); err != nil {
 		return nil, fmt.Errorf("lzma2: error verifying config: %w", err)
+	}
+
+	if lzmadec.Available() {
+		lr, err := lzmadec.NewLZMA2(readers[0], p, unpackSize, security.MaxDecoderMemory)
+		if err != nil {
+			return nil, fmt.Errorf("lzma2: error creating native reader: %w", err)
+		}
+
+		return &readCloser{
+			c: lr,
+			r: lr,
+		}, nil
 	}
 
 	lr, err := config.NewReader2(readers[0])

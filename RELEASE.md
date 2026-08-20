@@ -20,7 +20,8 @@ Official binary releases of this port must be cryptographically signed. Each
 official release must provide:
 
 - a versioned source tag tied to the reviewed source revision;
-- binaries built from that revision;
+- per-target packages containing binaries built from that revision, their
+  CycloneDX SBOM, and the applicable license and provenance files;
 - cryptographic checksums for every distributed artifact;
 - a signature or signed provenance attestation covering the artifacts and
   checksums; and

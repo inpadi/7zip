@@ -125,7 +125,9 @@ func processVirtualDisk(archive string, patterns []string, format Format, dst io
 		return Result{}, err
 	}
 	defer root.Close()
-	n, wrote, err := extractEntry(root, entry.Name, entry.Mode, entry.Size, reader, *extract, make(map[string]string), &budget)
+	parents := extractionParents(root, *extract)
+	defer parents.Close()
+	n, wrote, err := extractEntry(parents, entry.Name, entry.Mode, entry.Size, reader, *extract, make(map[string]string), &budget)
 	if err != nil {
 		return Result{}, err
 	}

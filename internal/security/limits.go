@@ -3,10 +3,20 @@ package security
 import (
 	"fmt"
 	"io"
+	"sync"
 	"time"
 )
 
 const MaxOperationDuration = 30 * time.Minute
+
+const copyBufferSize = 256 << 10
+
+var copyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, copyBufferSize)
+		return &buffer
+	},
+}
 
 const (
 	MaxArchiveEntries     = 100_000
@@ -77,7 +87,9 @@ func (b *Budget) Copy(dst io.Writer, src io.Reader, name string) (int64, error) 
 	}
 	limit := min(MaxFileBytes, remaining)
 	reader := &io.LimitedReader{R: deadlineReader{reader: src, deadline: b.deadline}, N: limit + 1}
-	n, err := io.Copy(dst, reader)
+	buffer := copyBufferPool.Get().(*[]byte)
+	n, err := io.CopyBuffer(writerOnly{Writer: dst}, reader, *buffer)
+	copyBufferPool.Put(buffer)
 	if n > limit {
 		return n, fmt.Errorf("archive entry %q exceeds its extraction budget", name)
 	}
@@ -87,6 +99,8 @@ func (b *Budget) Copy(dst io.Writer, src io.Reader, name string) (int64, error) 
 	}
 	return n, nil
 }
+
+type writerOnly struct{ io.Writer }
 
 type deadlineReader struct {
 	reader   io.Reader

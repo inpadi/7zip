@@ -2,10 +2,11 @@
 package bzip2
 
 import (
-	"compress/bzip2"
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/inpadi/7zip/internal/bzip2reader"
 )
 
 type readCloser struct {
@@ -50,9 +51,13 @@ func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 	if len(readers) != 1 {
 		return nil, errNeedOneReader
 	}
+	reader, err := bzip2reader.NewReader(readers[0])
+	if err != nil {
+		return nil, fmt.Errorf("bzip2: error creating reader: %w", errors.Join(err, readers[0].Close()))
+	}
 
 	return &readCloser{
-		c: readers[0],
-		r: bzip2.NewReader(readers[0]),
+		c: reader,
+		r: reader,
 	}, nil
 }

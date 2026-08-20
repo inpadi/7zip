@@ -2,18 +2,17 @@ package archivefmt
 
 import (
 	"archive/tar"
-	"compress/bzip2"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
-	dsnetbzip2 "github.com/dsnet/compress/bzip2"
 	"github.com/inpadi/7zip/internal/archive7z"
+	"github.com/inpadi/7zip/internal/bzip2reader"
 	"github.com/inpadi/7zip/internal/security"
+	"github.com/inpadi/7zip/internal/xz"
 	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
 )
 
 type tarInput struct {
@@ -30,6 +29,7 @@ func openTar(archive string, format Format) (*tarInput, error) {
 	}
 	reader := io.Reader(file)
 	closeCompression := func() error { return nil }
+	closeFile := file.Close
 	switch format {
 	case FormatTarGzip:
 		compressed, gzipErr := gzip.NewReader(file)
@@ -40,7 +40,14 @@ func openTar(archive string, format Format) (*tarInput, error) {
 		reader = compressed
 		closeCompression = compressed.Close
 	case FormatTarBzip2:
-		reader = bzip2.NewReader(file)
+		compressed, bzipErr := bzip2reader.NewReader(file)
+		if bzipErr != nil {
+			_ = file.Close()
+			return nil, bzipErr
+		}
+		reader = compressed
+		closeCompression = compressed.Close
+		closeFile = func() error { return nil }
 	case FormatTarXZ:
 		compressed, xzErr := newXZReader(file)
 		if xzErr != nil {
@@ -51,10 +58,9 @@ func openTar(archive string, format Format) (*tarInput, error) {
 		closeCompression = compressed.Close
 	case FormatTarZstd:
 		compressed, zstdErr := zstd.NewReader(file,
-			zstd.WithDecoderConcurrency(1),
 			zstd.WithDecoderMaxMemory(security.MaxDecoderMemory),
 			zstd.WithDecoderMaxWindow(security.MaxDecoderMemory),
-			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderLowmem(false),
 		)
 		if zstdErr != nil {
 			_ = file.Close()
@@ -72,7 +78,7 @@ func openTar(archive string, format Format) (*tarInput, error) {
 		compressed: info.Size(),
 		close: func() error {
 			compressionErr := closeCompression()
-			fileErr := file.Close()
+			fileErr := closeFile()
 			if compressionErr != nil {
 				return compressionErr
 			}
@@ -98,11 +104,7 @@ func newTarOutput(dst io.Writer, format Format, level int) (*tarOutput, error) {
 		archiveWriter = compressed
 		closeCompression = compressed.Close
 	case FormatTarBzip2:
-		config := &dsnetbzip2.WriterConfig{}
-		if level >= 0 {
-			config.Level = max(level, 1)
-		}
-		compressed, err := dsnetbzip2.NewWriter(dst, config)
+		compressed, err := newBzip2Writer(dst, bzip2BlockLevel(level))
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +115,7 @@ func newTarOutput(dst io.Writer, format Format, level int) (*tarOutput, error) {
 		if level >= 0 {
 			config.DictCap = dictionaryForCompressionLevel(level)
 		}
-		compressed, err := config.NewWriter(dst)
+		compressed, err := newXZWriter(dst, config)
 		if err != nil {
 			return nil, err
 		}
@@ -408,6 +410,8 @@ func extractTar(archive string, options ExtractOptions, format Format) (Result, 
 		return Result{}, err
 	}
 	defer root.Close()
+	parents := extractionParents(root, options)
+	defer parents.Close()
 	input, err := openTar(archive, format)
 	if err != nil {
 		return Result{}, err
@@ -433,7 +437,7 @@ func extractTar(archive string, options ExtractOptions, format Format) (Result, 
 			continue
 		}
 		n, wrote, extractErr := extractEntry(
-			root,
+			parents,
 			header.Name,
 			header.FileInfo().Mode(),
 			uint64(max(header.Size, 0)),

@@ -344,6 +344,7 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 	}
 	defer iso.Close()
 	var root *security.Root
+	var parents *security.ParentCache
 	seen := make(map[string]string)
 	if extract != nil {
 		root, err = extractionRoot(extract.OutputDir)
@@ -351,6 +352,8 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 			return Result{}, err
 		}
 		defer root.Close()
+		parents = extractionParents(root, *extract)
+		defer parents.Close()
 	}
 	var result Result
 	var budget security.Budget
@@ -374,7 +377,7 @@ func processISO(archive string, patterns []string, dst io.Writer, extract *Extra
 			stream = reader
 		}
 		if extract != nil {
-			n, wrote, extractErr := extractEntry(root, item.name, item.mode, uint64(item.size), stream, *extract, seen, &budget)
+			n, wrote, extractErr := extractEntry(parents, item.name, item.mode, uint64(item.size), stream, *extract, seen, &budget)
 			if reader != nil {
 				closeErr := reader.Close()
 				if extractErr == nil {
