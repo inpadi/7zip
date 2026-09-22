@@ -55,6 +55,8 @@ The image formats are currently read-only. Differencing VHD/VHDX parents, WIM LZ
 
 Relevant switches include `-p{password}`, `-mhe=on|off`, `-ms=on|off`, `-mf=on|off`, `-mx[=0-9]`, `-m0={method}`, `-mep=direct|atomic`, `-si{name}`, `-so`, `-r`, `-i!{mask}`, `-x!{mask}`, `@listfile`, `-scs{charset}`, `-ba`, `-slt`, and `-t{type}`. The wildcard engine follows 7-Zip's `*`/`?` component rules; brackets are literal, an exact directory selects its subtree, and `-r` recursively applies wildcard masks. `l -ba` uses upstream-compatible fixed-width entry rows. Unsupported switches and incompatible format combinations fail explicitly.
 
+`-bd` and `-bsp0` are accepted to disable progress output; this port currently emits no progress indicator.
+
 Extraction creates absent destination files directly by default and removes a partial file if decoding or integrity validation fails. Direct mode reuses a pinned handle for adjacent files in the same directory; do not concurrently relocate the destination tree during extraction. `-mep=atomic` instead revalidates the directory identity for every file, writes and syncs a temporary file, and only then publishes it. Replacing an existing file always uses the temporary-file path.
 
 Extraction rejects traversal and absolute paths, filesystem links/junctions in output paths, special files, Windows device paths, flattened-name collisions, and unsafe overwrites.

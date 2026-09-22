@@ -481,6 +481,7 @@ func printUsage(w io.Writer) {
   -ba        : Disable the banner; list only entry rows with l
   -bb[0-3]   : Set output log level (accepted for compatibility)
   -bd        : Disable progress indicator
+  -bsp0      : Disable progress output
   -o{dir}    : Set output directory
   -mhe=on|off: Encrypt or expose 7z archive headers
   -m0={name} : Set compression method

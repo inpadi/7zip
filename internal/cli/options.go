@@ -191,7 +191,9 @@ func parseSwitch(opts *Options, arg string) error {
 		opts.Overwrite = OverwriteAll
 	case s == "aos":
 		opts.Overwrite = OverwriteSkip
-	case s == "bd", s == "bb", s == "bb0", s == "bb1", s == "bb2", s == "bb3":
+	case s == "bd", s == "bsp0":
+		// No progress indicator is emitted, so progress is already disabled.
+	case s == "bb", s == "bb0", s == "bb1", s == "bb2", s == "bb3":
 		// Accepted output-only switches do not change archive semantics.
 	case s == "ba":
 		opts.Bare = true

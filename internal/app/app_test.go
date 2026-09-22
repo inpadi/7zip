@@ -37,13 +37,13 @@ func TestRunAddListTestExtract(t *testing.T) {
 	}
 	archive := filepath.Join(root, "hello.7z")
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"a", archive, source}, &stdout, &stderr); code != ExitSuccess {
+	if code := Run([]string{"a", "-bsp0", archive, source}, &stdout, &stderr); code != ExitSuccess {
 		t.Fatalf("add code = %d, stderr = %s", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"l", archive}, &stdout, &stderr); code != ExitSuccess {
+	if code := Run([]string{"l", "-bsp0", archive}, &stdout, &stderr); code != ExitSuccess {
 		t.Fatalf("list code = %d, stderr = %s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "hello.txt") {
@@ -52,14 +52,14 @@ func TestRunAddListTestExtract(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"t", archive}, &stdout, &stderr); code != ExitSuccess {
+	if code := Run([]string{"t", "-bsp0", archive}, &stdout, &stderr); code != ExitSuccess {
 		t.Fatalf("test code = %d, stderr = %s", code, stderr.String())
 	}
 
 	output := filepath.Join(root, "output")
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"x", "-o" + output, archive}, &stdout, &stderr); code != ExitSuccess {
+	if code := Run([]string{"x", "-bsp0", "-o" + output, archive}, &stdout, &stderr); code != ExitSuccess {
 		t.Fatalf("extract code = %d, stderr = %s", code, stderr.String())
 	}
 	content, err := os.ReadFile(filepath.Join(output, "hello.txt"))
@@ -116,7 +116,7 @@ func TestRunStandardStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	var archive, stderr bytes.Buffer
-	if code := RunWithIO([]string{"a", "-ttar", "-so", "ignored.tar", source}, strings.NewReader(""), &archive, &stderr); code != ExitSuccess {
+	if code := RunWithIO([]string{"a", "-bsp0", "-ttar", "-so", "ignored.tar", source}, strings.NewReader(""), &archive, &stderr); code != ExitSuccess {
 		t.Fatalf("stdout archive code = %d, stderr = %s", code, stderr.String())
 	}
 	reader := tar.NewReader(bytes.NewReader(archive.Bytes()))
@@ -137,7 +137,7 @@ func TestRunStandardStreams(t *testing.T) {
 
 	var extracted bytes.Buffer
 	stderr.Reset()
-	if code := RunWithIO([]string{"x", "-si", "-so", "-ttar"}, bytes.NewReader(archive.Bytes()), &extracted, &stderr); code != ExitSuccess {
+	if code := RunWithIO([]string{"x", "-bsp0", "-si", "-so", "-ttar"}, bytes.NewReader(archive.Bytes()), &extracted, &stderr); code != ExitSuccess {
 		t.Fatalf("stdin archive code = %d, stderr = %s", code, stderr.String())
 	}
 	if extracted.String() != "stream payload" {
