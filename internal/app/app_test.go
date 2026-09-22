@@ -116,7 +116,7 @@ func TestRunStandardStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	var archive, stderr bytes.Buffer
-	if code := RunWithIO([]string{"a", "-bsp0", "-ttar", "-so", "ignored.tar", source}, strings.NewReader(""), &archive, &stderr); code != ExitSuccess {
+	if code := RunWithIO([]string{"a", "-bsp0", "-sccUTF-8", "-ttar", "-so", "ignored.tar", source}, strings.NewReader(""), &archive, &stderr); code != ExitSuccess {
 		t.Fatalf("stdout archive code = %d, stderr = %s", code, stderr.String())
 	}
 	reader := tar.NewReader(bytes.NewReader(archive.Bytes()))
@@ -137,7 +137,7 @@ func TestRunStandardStreams(t *testing.T) {
 
 	var extracted bytes.Buffer
 	stderr.Reset()
-	if code := RunWithIO([]string{"x", "-bsp0", "-si", "-so", "-ttar"}, bytes.NewReader(archive.Bytes()), &extracted, &stderr); code != ExitSuccess {
+	if code := RunWithIO([]string{"x", "-bsp0", "-sccUTF-8", "-si", "-so", "-ttar"}, bytes.NewReader(archive.Bytes()), &extracted, &stderr); code != ExitSuccess {
 		t.Fatalf("stdin archive code = %d, stderr = %s", code, stderr.String())
 	}
 	if extracted.String() != "stream payload" {
@@ -162,7 +162,8 @@ func TestRunStandardStreams(t *testing.T) {
 
 func TestRunBareListOutput(t *testing.T) {
 	root := t.TempDir()
-	source := filepath.Join(root, "hello.txt")
+	const filename = "blåbær-日本語-😀.txt"
+	source := filepath.Join(root, filename)
 	if err := os.WriteFile(source, []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +174,7 @@ func TestRunBareListOutput(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"l", "-ba", archive}, &stdout, &stderr); code != ExitSuccess {
+	if code := Run([]string{"l", "-ba", "-sccUTF-8", archive}, &stdout, &stderr); code != ExitSuccess {
 		t.Fatalf("bare list code = %d, stderr = %s", code, stderr.String())
 	}
 	output := strings.TrimRight(stdout.String(), "\r\n")
@@ -185,7 +186,7 @@ func TestRunBareListOutput(t *testing.T) {
 	if lines := strings.Split(output, "\n"); len(lines) != 1 {
 		t.Fatalf("bare list lines = %q", lines)
 	}
-	if !strings.HasSuffix(output, "  hello.txt") || !strings.Contains(output, "....A            5") {
+	if !strings.HasSuffix(output, "  "+filename) || !strings.Contains(output, "....A            5") {
 		t.Fatalf("bare list row = %q", output)
 	}
 }

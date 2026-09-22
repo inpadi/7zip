@@ -491,6 +491,7 @@ func printUsage(w io.Writer) {
   -ms=on|off : Enable or disable solid 7z blocks
   -p{value}  : Set creation or extraction password
   -r[-|0]    : Recurse wildcard matches
+  -sccUTF-8  : Use UTF-8 for console text (the default)
   -scs{name} : Set UTF-8 or UTF-16 list-file encoding
   -si{name}  : Read an archive or one input file from stdin
   -slt       : Show technical information for list command

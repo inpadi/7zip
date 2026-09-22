@@ -57,6 +57,8 @@ Relevant switches include `-p{password}`, `-mhe=on|off`, `-ms=on|off`, `-mf=on|o
 
 `-bd` and `-bsp0` are accepted to disable progress output; this port currently emits no progress indicator.
 
+`-sccUTF-8` selects the console text encoding, which is already UTF-8 by default, including redirected output. List-file encoding is controlled separately by `-scs{charset}`.
+
 Extraction creates absent destination files directly by default and removes a partial file if decoding or integrity validation fails. Direct mode reuses a pinned handle for adjacent files in the same directory; do not concurrently relocate the destination tree during extraction. `-mep=atomic` instead revalidates the directory identity for every file, writes and syncs a temporary file, and only then publishes it. Replacing an existing file always uses the temporary-file path.
 
 Extraction rejects traversal and absolute paths, filesystem links/junctions in output paths, special files, Windows device paths, flattened-name collisions, and unsafe overwrites.

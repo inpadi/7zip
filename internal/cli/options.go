@@ -226,6 +226,8 @@ func parseSwitch(opts *Options, arg string) error {
 	case strings.HasPrefix(s, "si"):
 		opts.Stdin = true
 		opts.StdinName = arg[3:]
+	case s == "sccutf-8":
+		// Console text already uses UTF-8, including redirected output.
 	case strings.HasPrefix(s, "scs"):
 		charset := strings.ToLower(strings.ReplaceAll(arg[4:], "_", "-"))
 		switch charset {
